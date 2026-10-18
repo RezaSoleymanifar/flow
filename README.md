@@ -66,6 +66,7 @@ block gets only its listed tools. A `once` step cut off mid-run is never retried
 
 ```
 sudo bash setup.sh          # once: sandbox user, Claude token, the `flow` command, a 15-minute schedule
+flow new block NAME [--external WHO] [--check] [--record]   # scaffold a block; flow new workflow NAME BLOCK... chains blocks
 flow validate               # check every workflow and its blocks
 flow add WORKFLOW '{"name": "Sam"}' --key sam
 flow add WORKFLOW @preset --key sam    # a named input from flavors.yaml ({workflow: {preset: input}}): one graph, many presets

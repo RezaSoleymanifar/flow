@@ -462,6 +462,17 @@ class Cli(Base):
         self.assertEqual(json.loads(self.flow("report", "other")), {})
         self.assertEqual(json.loads(self.flow("report", "--since", "2999-01-01")), {})
 
+    def test_new_scaffolds_blocks_and_a_workflow_that_validate_and_run(self):
+        self.flow("new", "block", "triage", "--check", "--record"); self.flow("new", "block", "ship", "--external", "chrome")
+        out = json.loads(self.flow("new", "workflow", "handle", "triage", "ship"))
+        self.assertEqual(out["problems"], [])
+        for fn in ("block.yaml", "prompt.md", "check.py", "record.py"): self.assertTrue(os.path.exists(os.path.join(self.home, "blocks", "triage", fn)))
+        p = self.run_flow("new", "block", "triage"); self.assertEqual(p.returncode, 2); self.assertIn("already exists", p.stdout)
+        p = self.run_flow("new", "workflow", "x", "nope"); self.assertEqual(p.returncode, 2); self.assertIn("no block", p.stdout)
+        self.add({"q": 1}, key="h1", wf="handle"); self.script({"result": "ok"}); self.tick()
+        st = json.loads(self.flow("show", "h1"))
+        self.assertEqual((st["step"], st["status"]), ("ship", "external"))   # triage ran, check+record stubs passed, waits on chrome
+
     def test_items_without_a_key_get_unique_ids(self):
         ids = {json.loads(self.flow("add", "reply", "{}"))["added"] for _ in range(5)}
         self.assertEqual(len(ids), 5)

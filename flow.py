@@ -18,6 +18,8 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow done ITEM JSON                  hand an external step its result (checked like a worker's answer)
   flow fail ITEM REASON                report that an external step could not be done
   flow validate [WORKFLOW]             check workflow files and the blocks they use
+  flow new block NAME [--external WHO] [--check] [--record]   scaffold blocks/NAME (block.yaml, prompt.md, stubs)
+  flow new workflow NAME BLOCK [BLOCK...]                      scaffold workflows/NAME.yaml as a straight chain
 
 A block with `external: <who>` (e.g. chrome, human) is not run by a Claude session: the item waits in status
 "external" until `flow done` or `flow fail` brings the result. The result goes through the block's format,
@@ -499,6 +501,65 @@ def report(wfname=None, since=None):
     return rep
 
 
+# ---------- scaffolding ----------
+BLOCK_YAML = """# %(name)s: <one line: what this step does and what it must never do>
+%(external)soutput:                         # JSON Schema the answer must match; the engine rejects anything else
+  type: object
+  required: [result]
+  properties:
+    result: {type: string}
+%(tools)s%(check)s%(record)s"""
+PROMPT_MD = "Instructions for this step. Say what to do, what to report, and what to stop and `flow fail` on.\n"
+CHECK_PY = ('"""Hard rules on this step\'s answer. Exit 0 = pass. Exit 1 + a line on stdout = fail, the worker retries with\n'
+            'that line. Exit 2 = fail for good, no retry (e.g. a do-not-contact rule)."""\n'
+            'import json, sys\n'
+            'd = json.load(sys.stdin)        # {"out": the answer, "data": the item\'s data}\n')
+RECORD_PY = ('"""Runs after the step passes, before it routes on. Write what the workflow must never forget to its own store.\n'
+             'A non-zero exit stops the item: nothing moves on unrecorded."""\n'
+             'import json, sys\n'
+             'd = json.load(sys.stdin)        # {"out", "data", "item", "workflow", "step"}\n')
+WORKFLOW_YAML = """# %(name)s: <one line: what goes in, what comes out>
+start: %(first)s
+steps:
+%(steps)s"""
+
+def new(kind, name, rest):
+    safe = safe_id(name)
+    if kind == "block":
+        d = os.path.join(HOME, "blocks", safe)
+        if os.path.exists(d): die("blocks/%s already exists" % safe)
+        os.makedirs(d)
+        ext = ""
+        if "--external" in rest:
+            i = rest.index("--external")
+            if i + 1 >= len(rest): die("--external needs a value (who does it: chrome, human, ...)")
+            ext = "external: %s                 # done outside the engine: the item waits for `flow done`\n" % rest[i + 1]
+        tools = "" if ext else "tools: []                       # e.g. [Read, Bash, WebSearch]; nothing = judge from the item alone\n"
+        files = {"block.yaml": BLOCK_YAML % {"name": safe, "external": ext, "tools": tools,
+                                             "check": "check: check.py\n" if "--check" in rest else "",
+                                             "record": "record: record.py\n" if "--record" in rest else ""},
+                 "prompt.md": PROMPT_MD}
+        if "--check" in rest: files["check.py"] = CHECK_PY
+        if "--record" in rest: files["record.py"] = RECORD_PY
+        for fn, body in files.items():
+            with open(os.path.join(d, fn), "w") as f: f.write(body)
+        return {"created": sorted(os.path.join("blocks", safe, fn) for fn in files)}
+    if kind == "workflow":
+        if not rest: die("usage: flow new workflow NAME BLOCK [BLOCK...]")
+        p = os.path.join(HOME, "workflows", safe + ".yaml")
+        if os.path.exists(p): die("workflows/%s.yaml already exists" % safe)
+        for b in rest:
+            if not os.path.isdir(os.path.join(HOME, "blocks", b)): die("no block %r (flow new block %s)" % (b, b))
+        steps = []
+        for i, b in enumerate(rest):
+            nxt = rest[i + 1] if i + 1 < len(rest) else "end"
+            steps.append("  %s:\n    block: %s\n    routes: [{to: %s}]" % (b, b, nxt))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f: f.write(WORKFLOW_YAML % {"name": safe, "first": rest[0], "steps": "\n".join(steps) + "\n"})
+        return {"created": os.path.join("workflows", safe + ".yaml"), "problems": validate(safe)}
+    die("usage: flow new block|workflow NAME ...")
+
+
 # ---------- cli ----------
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"): print(__doc__); return 0
@@ -562,6 +623,9 @@ def main(a):
                 event(st, "failed", who=b["external"], reason=" ".join(rest[1:]))
                 judge(wf, st, step, b, cwd, None, " ".join(rest[1:]))
             print(json.dumps({k: st.get(k) for k in ("id", "step", "status", "reason")})); return 0
+        if cmd == "new":
+            if len(rest) < 2: die("usage: flow new block NAME [--external WHO] [--check] [--record] | flow new workflow NAME BLOCK...")
+            print(json.dumps(new(rest[0], rest[1], rest[2:]))); return 0
         if cmd == "validate":
             wd = os.path.join(HOME, "workflows")
             names = rest or ([f[:-5] for f in sorted(os.listdir(wd)) if f.endswith(".yaml")] if os.path.isdir(wd) else [])
