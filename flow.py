@@ -204,6 +204,8 @@ def parse_reply(stdout, returncode, stderr, schema):
     except jsonschema.ValidationError as e: return None, "the answer broke the required format: %s" % e.message, sid, cost
     return out, None, sid, cost
 
+LAST_SECONDS = 0.0
+
 def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=None):
     """One headless turn. Returns (output_or_None, reason_or_None, session_id, cost)."""
     cmd = CLAUDE + ["-p", msg, "--output-format", "json", "--json-schema", json.dumps(schema),
@@ -213,12 +215,14 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     if mcp: cmd += ["--mcp-config", json.dumps({"mcpServers": mcp})]
     if model: cmd += ["--model", model]
     cmd += ["--resume", session] if resume else ["--session-id", session]
+    global LAST_SECONDS; t0 = time.time()
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        return None, "the session timed out after %ss" % TIMEOUT, None, None
+        LAST_SECONDS = round(time.time() - t0, 1); return None, "the session timed out after %ss" % TIMEOUT, None, None
     except OSError as e:
-        return None, "could not start claude: %s" % e, None, None
+        LAST_SECONDS = round(time.time() - t0, 1); return None, "could not start claude: %s" % e, None, None
+    LAST_SECONDS = round(time.time() - t0, 1)   # wall time of this call, logged on the work/review event
     record(cmd, p)
     return parse_reply(p.stdout, p.returncode, p.stderr, schema)
 
@@ -264,7 +268,7 @@ def review(b, out, st, cwd):
            % (b["review"], json.dumps(st["data"], indent=1, ensure_ascii=False), json.dumps(out, indent=1, ensure_ascii=False)))
     sid = str(uuid.uuid4())    # always a fresh session: the reviewer never shares history with the worker
     verdict, err, _, cost = claude(msg, REVIEW_SCHEMA, sid, False, model=b.get("review_model"), cwd=cwd)
-    event(st, "review", session=sid, passed=bool(verdict and verdict["pass"]), cost=cost, error=err)
+    event(st, "review", session=sid, passed=bool(verdict and verdict["pass"]), cost=cost, seconds=LAST_SECONDS, error=err)
     if err: return "the reviewer could not answer: " + err
     return None if verdict["pass"] else "reviewer: " + verdict["notes"]
 
@@ -322,7 +326,7 @@ def run_step(wf, st):
         event(st, "session_lost", session=sid); del st["sessions"][st["step"]]; resuming = False
         out, reason, got, cost = run(str(uuid.uuid4()), False)
     if got: st["sessions"][st["step"]] = got   # a lost one is caught by session_lost on the next resume
-    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, reason=reason)
+    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, seconds=LAST_SECONDS, reason=reason)
     judge(wf, st, step, b, cwd, out, reason)
 
 def external_result(wf, st, out):
@@ -473,12 +477,13 @@ def report(wfname=None, since=None):
             if wfname and e.get("workflow") != wfname: continue
             if since and e["ts"] < since: continue
             w = rep.setdefault(e["workflow"], {"items": set(), "done": set(), "stuck": set(), "claude_calls": 0, "cost_usd": 0.0,
-                                               "retries": 0, "first": e["ts"], "last": e["ts"], "steps": {}})
+                                               "claude_seconds": 0.0, "retries": 0, "first": e["ts"], "last": e["ts"], "steps": {}})
             w["items"].add(e["item"]); w["last"] = max(w["last"], e["ts"]); w["first"] = min(w["first"], e["ts"])
-            st = w["steps"].setdefault(e.get("step") or "?", {"work": 0, "external": 0, "review": 0, "retries": 0, "cost_usd": 0.0, "seconds": 0.0, "_open": {}})
+            st = w["steps"].setdefault(e.get("step") or "?", {"work": 0, "external": 0, "review": 0, "retries": 0, "cost_usd": 0.0, "claude_seconds": 0.0, "seconds": 0.0, "_open": {}})
             ev = e["event"]
             if ev in ("work", "review"):
                 w["claude_calls"] += 1; w["cost_usd"] += e.get("cost") or 0; st["cost_usd"] += e.get("cost") or 0; st[ev] += 1
+                w["claude_seconds"] += e.get("seconds") or 0; st["claude_seconds"] += e.get("seconds") or 0
             if ev == "external": st["external"] += 1; st["_open"][e["item"]] = ts(e)
             if ev == "done" and e["item"] in st["_open"]: st["seconds"] += (ts(e) - st["_open"].pop(e["item"])).total_seconds()
             if ev == "retry": w["retries"] += 1; st["retries"] += 1
@@ -486,10 +491,11 @@ def report(wfname=None, since=None):
             if ev == "stuck": w["stuck"].add(e["item"])
     for w in rep.values():
         w["items"] = len(w["items"]); w["done"] = len(w["done"]); w["stuck"] = len(w["stuck"])
-        w["cost_usd"] = round(w["cost_usd"], 4)
+        w["cost_usd"] = round(w["cost_usd"], 4); w["claude_seconds"] = round(w["claude_seconds"], 1)
         w["wall_minutes"] = round((datetime.strptime(w["last"][:19], "%Y-%m-%dT%H:%M:%S") - datetime.strptime(w["first"][:19], "%Y-%m-%dT%H:%M:%S")).total_seconds() / 60, 1)
         for st in w["steps"].values():
-            st.pop("_open"); st["cost_usd"] = round(st["cost_usd"], 4); st["external_wait_minutes"] = round(st.pop("seconds") / 60, 1)
+            st.pop("_open"); st["cost_usd"] = round(st["cost_usd"], 4); st["claude_seconds"] = round(st["claude_seconds"], 1)
+            st["external_wait_minutes"] = round(st.pop("seconds") / 60, 1)
     return rep
 
 

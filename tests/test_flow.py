@@ -456,6 +456,7 @@ class Cli(Base):
         rep = json.loads(self.flow("report"))["reply"]
         self.assertEqual((rep["items"], rep["done"], rep["stuck"]), (2, 2, 0))
         self.assertEqual(rep["claude_calls"], 7); self.assertAlmostEqual(rep["cost_usd"], 0.07)
+        self.assertGreater(rep["claude_seconds"], 0); self.assertIn("seconds", self.events("work")[0])
         self.assertEqual(rep["retries"], 1); self.assertEqual(rep["steps"]["draft"]["retries"], 1)
         self.assertEqual(rep["steps"]["draft"]["review"], 2); self.assertEqual(rep["steps"]["send"]["work"], 2)
         self.assertEqual(json.loads(self.flow("report", "other")), {})
