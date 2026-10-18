@@ -29,6 +29,12 @@ in status `external` until `flow done ITEM JSON` or `flow fail ITEM REASON` brin
 through the same format check, check script and reviewer as a worker's answer. This is how a step that needs a
 logged-in browser or a person plugs into an otherwise headless workflow.
 
+A **driver** (`driver: connect.py` in block.yaml) is a script that does the step for zero tokens: the item's data
+in on stdin, the answer out as JSON, then the same format check, check script, reviewer and record as any
+answer. Exit 3 means "I can't handle this one" and the item falls back to the block's `external` owner (an agent
+or a person), so the pattern is: let the agent do it once or twice, distill the script into the block folder, keep
+the agent as the fallback. One script per block; the block boundary is the script boundary.
+
 A check script exits 0 to pass, 1 to fail with a reason the worker can fix (printed on stdout), or 2 to fail for a
 reason no retry can change, such as a do-not-contact rule: the item stops at once.
 

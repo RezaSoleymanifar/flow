@@ -692,3 +692,55 @@ class External(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Drivers(Base):
+    """A script does the step for zero tokens; the agent is only the fallback."""
+    def driver(self, body, external="chrome", once=True, check=None):
+        cfg = {"output": {"type": "object", "required": ["sent"], "properties": {"sent": {"type": "boolean"}}},
+               "external": external, "driver": "drive.py", "once": once}
+        if check: cfg["check"] = "check.py"
+        self.block("ship", cfg, check=check)
+        with open(os.path.join(self.home, "blocks", "ship", "drive.py"), "w") as f: f.write(body)
+        self.workflow("ship", "start: a\nsteps:\n  a: {block: ship, routes: [{to: end}]}\n")
+
+    def test_driver_answer_goes_through_checks_and_record_with_no_claude_call(self):
+        self.driver("import json,sys\nd=json.load(sys.stdin)\nprint(json.dumps({'sent': True, 'who': d['data']['input']['name']}))")
+        self.add(key="d1", wf="ship"); self.tick()
+        st = self.state("d1"); self.assertEqual(st["status"], "done"); self.assertEqual(st["data"]["a"]["who"], "Sam")
+        self.assertEqual(self.calls(), []); ev = self.events("driver")[0]; self.assertTrue(ev["ok"]); self.assertIn("seconds", ev)
+
+    def test_driver_that_declines_falls_back_to_the_external_owner(self):
+        self.driver("import sys\nprint('no Connect button on this page'); sys.exit(3)")
+        self.add(key="d1", wf="ship"); self.tick()
+        st = self.state("d1"); self.assertEqual(st["status"], "external")
+        self.assertIn("no Connect button", self.events("driver_declined")[0]["reason"])
+        self.flow("done", "d1", '{"sent": true}'); self.assertEqual(self.state("d1")["status"], "done")
+
+    def test_driver_crash_or_bad_answer_counts_as_a_failed_attempt(self):
+        self.driver("import sys\nsys.stderr.write('browser died'); sys.exit(1)", once=False)
+        self.add(key="d1", wf="ship"); self.tick()                     # a tick retries a normal step until stuck
+        st = self.state("d1"); self.assertEqual((st["status"], st["attempt"]), ("stuck", 3)); self.assertIn("browser died", st["reason"])
+        self.assertEqual(len(self.events("driver")), 3); self.assertEqual(self.calls(), [])
+        self.driver("print('not json')", once=False); self.add(key="d2", wf="ship"); self.tick()
+        self.assertIn("no JSON", self.state("d2")["reason"])
+
+    def test_driver_failure_on_a_once_step_is_stuck_not_retried(self):
+        self.driver("import sys\nsys.exit(1)")
+        self.add(key="d1", wf="ship"); self.tick(); self.tick()
+        st = self.state("d1"); self.assertEqual(st["status"], "stuck"); self.assertEqual(len(self.events("driver")), 1)
+
+    def test_driver_answer_is_checked_like_any_answer(self):
+        self.driver("import json\nprint(json.dumps({'sent': False}))", once=False,
+                    check="import json,sys\nd=json.load(sys.stdin)\nif not d['out']['sent']: print('nothing was sent'); sys.exit(1)\n")
+        self.add(key="d1", wf="ship"); self.tick()
+        self.assertIn("nothing was sent", self.state("d1")["reason"])
+
+    def test_declining_driver_without_an_external_owner_fails_the_attempt(self):
+        self.driver("import sys\nsys.exit(3)", external=None, once=False)
+        self.add(key="d1", wf="ship"); self.tick()
+        self.assertIn("no external owner", self.state("d1")["reason"])
+
+    def test_validate_catches_a_missing_driver_script(self):
+        self.driver("print('{}')"); os.remove(os.path.join(self.home, "blocks", "ship", "drive.py"))
+        self.assertIn("driver script drive.py is missing", json.loads(self.run_flow("validate").stdout)["ship"][0])

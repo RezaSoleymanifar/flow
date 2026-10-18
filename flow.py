@@ -21,6 +21,9 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow new block NAME [--external WHO] [--check] [--record]   scaffold blocks/NAME (block.yaml, prompt.md, stubs)
   flow new workflow NAME BLOCK [BLOCK...]                      scaffold workflows/NAME.yaml as a straight chain
 
+A block with `driver: <script>` is done by that script for zero tokens: item data in on stdin, the answer out as
+JSON, then the same checks and record as any answer. Exit 3 = "I can't handle this one": the item falls back to
+the block's `external` owner. One script per block; the block boundary is the script boundary.
 A block with `external: <who>` (e.g. chrome, human) is not run by a Claude session: the item waits in status
 "external" until `flow done` or `flow fail` brings the result. The result goes through the block's format,
 check and reviewer like any other answer.
@@ -320,8 +323,38 @@ def judge(wf, st, step, b, cwd, out, reason):
         st["status"] = "waiting"; event(st, "gate"); save(st); return
     route(wf, st, out)
 
+def run_driver(b, st, cwd):
+    """A script that does the step for zero tokens. Gets the item's data on stdin, answers JSON on stdout.
+    Returns (out, reason, handled): exit 0 = answer; exit 3 = can't handle this one, fall back to external;
+    anything else = a failure counted like a worker's."""
+    path = os.path.join(b["dir"], b["driver"])
+    if not os.path.exists(path): raise ConfigError("driver script %s is missing" % b["driver"])
+    argv = [sys.executable, path] if path.endswith(".py") else [path]
+    global LAST_SECONDS; t0 = time.time()
+    try:
+        p = subprocess.run(argv, input=json.dumps({"data": st["data"], "item": st["id"], "workflow": st["workflow"], "step": st["step"],
+                                                   "feedback": st.get("feedback")}), capture_output=True, text=True, cwd=cwd, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired: LAST_SECONDS = round(time.time() - t0, 2); return None, "the driver timed out after %ss" % TIMEOUT, True
+    except OSError as e: raise ConfigError("driver script could not run: %s" % e)
+    LAST_SECONDS = round(time.time() - t0, 2)
+    if p.returncode == 3: return None, (p.stdout.strip() or p.stderr.strip()[-400:] or "driver declined"), False
+    if p.returncode != 0: return None, "driver failed (exit %d): %s" % (p.returncode, (p.stderr.strip() or p.stdout.strip())[-400:]), True
+    try: out = json.loads(p.stdout)
+    except ValueError: return None, "driver gave no JSON: %s" % p.stdout[-300:], True
+    try: jsonschema.validate(out, b["output"])
+    except jsonschema.ValidationError as e: return None, "the driver's answer broke the required format: %s" % e.message, True
+    return out, None, True
+
 def run_step(wf, st):
     step, b, cwd = step_of(wf, st)
+    if b.get("driver"):   # a script does it; if it declines, the step falls through to its external owner
+        st["status"] = "running"; save(st)
+        out, reason, handled = run_driver(b, st, cwd)
+        if handled:
+            event(st, "driver", ok=reason is None, seconds=LAST_SECONDS, reason=reason)
+            return judge(wf, st, step, b, cwd, out, reason)
+        event(st, "driver_declined", reason=reason)
+        if not b["external"]: return judge(wf, st, step, b, cwd, None, "driver declined and the block has no external owner: " + reason)
     if b["external"]:   # someone outside the engine does this step; flow done / flow fail bring the result
         st["status"] = "external"; event(st, "external", who=b["external"], feedback=st.get("feedback")); save(st); return
     st["status"] = "running"; save(st)
@@ -452,7 +485,10 @@ def validate(name):
     errs, steps = [], wf["steps"]
     for s, cfg in steps.items():
         cfg = cfg or {}
-        try: block(cfg.get("block"))
+        try:
+            b = block(cfg.get("block"))
+            for k in ("check", "record", "driver"):
+                if b.get(k) and not os.path.exists(os.path.join(b["dir"], b[k])): errs.append("%s: %s script %s is missing" % (s, k, b[k]))
         except Exception as e: errs.append("%s: %s" % (s, e))
         routes = cfg.get("routes", [])
         if not isinstance(routes, list): errs.append("%s: routes must be a list" % s); continue
@@ -488,6 +524,7 @@ def report(wfname=None, since=None):
             w["items"].add(e["item"]); w["last"] = max(w["last"], e["ts"]); w["first"] = min(w["first"], e["ts"])
             st = w["steps"].setdefault(e.get("step") or "?", {"work": 0, "external": 0, "review": 0, "retries": 0, "cost_usd": 0.0, "claude_seconds": 0.0, "seconds": 0.0, "_open": {}})
             ev = e["event"]
+            if ev == "driver": st["driver"] = st.get("driver", 0) + 1; st["claude_seconds"] += 0
             if ev in ("work", "review"):
                 w["claude_calls"] += 1; w["cost_usd"] += e.get("cost") or 0; st["cost_usd"] += e.get("cost") or 0; st[ev] += 1
                 w["claude_seconds"] += e.get("seconds") or 0; st["claude_seconds"] += e.get("seconds") or 0
