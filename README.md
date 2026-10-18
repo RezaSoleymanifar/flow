@@ -66,6 +66,7 @@ block gets only its listed tools. A `once` step cut off mid-run is never retried
 sudo bash setup.sh          # once: sandbox user, Claude token, the `flow` command, a 15-minute schedule
 flow validate               # check every workflow and its blocks
 flow add WORKFLOW '{"name": "Sam"}' --key sam
+flow add WORKFLOW @preset --key sam    # a named input from flavors.yaml ({workflow: {preset: input}}): one graph, many presets
 flow tick                   # run ready items (cron does this)
 flow status | flow show ITEM
 flow approve ITEM | flow reject ITEM NOTE | flow jump ITEM STEP [NOTE]

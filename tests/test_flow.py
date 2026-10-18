@@ -441,6 +441,14 @@ class Cli(Base):
         self.script(SENT); self.tick(); self.assertEqual(self.state("s")["status"], "done")
         p = self.run_flow("add", "reply", "{}", "--step", "nope"); self.assertEqual(p.returncode, 2); self.assertIn("no step", p.stdout)
 
+    def test_add_takes_a_named_flavor_from_flavors_yaml(self):
+        with open(os.path.join(self.home, "flavors.yaml"), "w") as f:
+            f.write("reply:\n  warm: {name: Sam, tone: warm}\n  cold: {name: Sam, tone: cold}\n")
+        self.flow("add", "reply", "@warm", "--key", "w")
+        self.assertEqual(self.state("w")["data"]["input"], {"name": "Sam", "tone": "warm", "flavor": "warm"})
+        p = self.run_flow("add", "reply", "@nope"); self.assertEqual(p.returncode, 2); self.assertIn("no flavor", p.stdout)
+        p = self.run_flow("add", "other", "@warm"); self.assertEqual(p.returncode, 2)
+
     def test_items_without_a_key_get_unique_ids(self):
         ids = {json.loads(self.flow("add", "reply", "{}"))["added"] for _ in range(5)}
         self.assertEqual(len(ids), 5)

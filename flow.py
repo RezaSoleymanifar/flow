@@ -6,7 +6,8 @@ A WORKFLOW wires blocks into a graph: workflows/<name>.yaml. An ITEM is one unit
 Every item-step pair keeps its own Claude session (its own conversation history); the item's state file holds the
 pointers. Retry, loop back and jump are all the same move: point the item at a step, resume that step's session.
 
-  flow add WORKFLOW [JSON] [--key K] [--step S]   new item (at the start step, or S); JSON becomes data.input; --key dedupes
+  flow add WORKFLOW [JSON|@FLAVOR] [--key K] [--step S]   new item (at the start step, or S); JSON, or a preset from
+                                       FLOW_HOME/flavors.yaml ({workflow: {flavor: input}}), becomes data.input; --key dedupes
   flow tick [WORKFLOW]                 run every ready item until it ends, waits at a gate or gets stuck
   flow status [WORKFLOW]               one JSON line per item
   flow show ITEM                       one item's whole state
@@ -68,6 +69,17 @@ def event(item, ev, **detail):
     with open(os.path.join(RUNS, "events.jsonl"), "a") as f:
         f.write(json.dumps({"ts": now(), "item": item.get("id"), "workflow": item.get("workflow"),
                             "step": item.get("step"), "event": ev, **detail}) + "\n")
+
+def flavor(wfname, name):
+    """A named preset of item input, from FLOW_HOME/flavors.yaml: {workflow: {flavor: {...input}}}."""
+    p = os.path.join(HOME, "flavors.yaml")
+    if not os.path.exists(p): die("no flavors.yaml in %s" % HOME)
+    with open(p) as f: fl = yaml.safe_load(f) or {}
+    if name not in (fl.get(wfname) or {}): die("no flavor %r for workflow %s (have: %s)" % (name, wfname, ", ".join(fl.get(wfname) or [])))
+    inp = fl[wfname][name]
+    if not isinstance(inp, dict): die("flavor %s.%s must be a mapping" % (wfname, name))
+    return dict(inp, flavor=name)
+
 
 def workflow(name):
     p = os.path.join(HOME, "workflows", name + ".yaml")
@@ -456,8 +468,10 @@ def main(a):
                     if i + 1 >= len(rest): die("%s needs a value" % o)
                     opts[o] = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
             if not rest: die("usage: flow add WORKFLOW [JSON] [--key K] [--step S]")
-            try: inp = json.loads(rest[1]) if len(rest) > 1 else {}
-            except ValueError: die("input is not valid JSON")
+            if len(rest) > 1 and rest[1].startswith("@"): inp = flavor(rest[0], rest[1][1:])   # named preset
+            else:
+                try: inp = json.loads(rest[1]) if len(rest) > 1 else {}
+                except ValueError: die("input is not valid JSON")
             if "--step" in opts and opts["--step"] not in workflow(rest[0])["steps"]: die("no step %r in %s" % (opts["--step"], rest[0]))
             key = opts.get("--key"); st = new_item(rest[0], inp, key, opts.get("--step"))
             print(json.dumps({"added": st["id"]} if st else {"exists": safe_id(key)})); return 0
