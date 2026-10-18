@@ -9,6 +9,7 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow add WORKFLOW [JSON|@FLAVOR] [--key K] [--step S]   new item (at the start step, or S); JSON, or a preset from
                                        FLOW_HOME/flavors.yaml ({workflow: {flavor: input}}), becomes data.input; --key dedupes
   flow tick [WORKFLOW]                 run every ready item until it ends, waits at a gate or gets stuck
+  flow report [WORKFLOW] [--since DATE]   items, Claude calls, cost, retries, wait per step, from the events log
   flow status [WORKFLOW]               one JSON line per item
   flow show ITEM                       one item's whole state
   flow approve ITEM                    pass a gate
@@ -457,6 +458,41 @@ def validate(name):
     return errs
 
 
+# ---------- report ----------
+def report(wfname=None, since=None):
+    """Cost, time and steps per workflow and per step, from the events log. `since` is an ISO date prefix."""
+    from datetime import datetime
+    p = os.path.join(RUNS, "events.jsonl")
+    if not os.path.exists(p): return {}
+    def ts(e): return datetime.strptime(e["ts"][:19], "%Y-%m-%dT%H:%M:%S")
+    rep = {}
+    with open(p) as f:
+        for l in f:
+            try: e = json.loads(l)
+            except ValueError: continue
+            if wfname and e.get("workflow") != wfname: continue
+            if since and e["ts"] < since: continue
+            w = rep.setdefault(e["workflow"], {"items": set(), "done": set(), "stuck": set(), "claude_calls": 0, "cost_usd": 0.0,
+                                               "retries": 0, "first": e["ts"], "last": e["ts"], "steps": {}})
+            w["items"].add(e["item"]); w["last"] = max(w["last"], e["ts"]); w["first"] = min(w["first"], e["ts"])
+            st = w["steps"].setdefault(e.get("step") or "?", {"work": 0, "external": 0, "review": 0, "retries": 0, "cost_usd": 0.0, "seconds": 0.0, "_open": {}})
+            ev = e["event"]
+            if ev in ("work", "review"):
+                w["claude_calls"] += 1; w["cost_usd"] += e.get("cost") or 0; st["cost_usd"] += e.get("cost") or 0; st[ev] += 1
+            if ev == "external": st["external"] += 1; st["_open"][e["item"]] = ts(e)
+            if ev == "done" and e["item"] in st["_open"]: st["seconds"] += (ts(e) - st["_open"].pop(e["item"])).total_seconds()
+            if ev == "retry": w["retries"] += 1; st["retries"] += 1
+            if ev == "done" and e.get("step") is None or ev == "done" and e.get("who") is None: w["done"].add(e["item"])
+            if ev == "stuck": w["stuck"].add(e["item"])
+    for w in rep.values():
+        w["items"] = len(w["items"]); w["done"] = len(w["done"]); w["stuck"] = len(w["stuck"])
+        w["cost_usd"] = round(w["cost_usd"], 4)
+        w["wall_minutes"] = round((datetime.strptime(w["last"][:19], "%Y-%m-%dT%H:%M:%S") - datetime.strptime(w["first"][:19], "%Y-%m-%dT%H:%M:%S")).total_seconds() / 60, 1)
+        for st in w["steps"].values():
+            st.pop("_open"); st["cost_usd"] = round(st["cost_usd"], 4); st["external_wait_minutes"] = round(st.pop("seconds") / 60, 1)
+    return rep
+
+
 # ---------- cli ----------
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"): print(__doc__); return 0
@@ -478,6 +514,11 @@ def main(a):
             key = opts.get("--key"); st = new_item(rest[0], inp, key, opts.get("--step"))
             print(json.dumps({"added": st["id"]} if st else {"exists": safe_id(key)})); return 0
         if cmd == "tick": print(json.dumps(tick(rest[0] if rest else None))); return 0
+        if cmd == "report":
+            since = None
+            if "--since" in rest:
+                i = rest.index("--since"); since = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
+            print(json.dumps(report(rest[0] if rest else None, since), indent=1)); return 0
         if cmd == "status":
             for s in all_items(rest[0] if rest else None):
                 print(json.dumps({k: s.get(k) for k in ("id", "workflow", "step", "status", "attempt", "reason")}))

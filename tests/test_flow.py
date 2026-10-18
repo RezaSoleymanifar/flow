@@ -450,6 +450,17 @@ class Cli(Base):
         p = self.run_flow("add", "reply", "@nope"); self.assertEqual(p.returncode, 2); self.assertIn("no flavor", p.stdout)
         p = self.run_flow("add", "other", "@warm"); self.assertEqual(p.returncode, 2)
 
+    def test_report_counts_items_calls_cost_retries_per_workflow_and_step(self):
+        self.add(key="a"); self.add(key="b")
+        self.script({"intent": "reply", "text": "no - dashes"}, GOOD, PASS, SENT, GOOD, PASS, SENT); self.tick(); self.tick()
+        rep = json.loads(self.flow("report"))["reply"]
+        self.assertEqual((rep["items"], rep["done"], rep["stuck"]), (2, 2, 0))
+        self.assertEqual(rep["claude_calls"], 7); self.assertAlmostEqual(rep["cost_usd"], 0.07)
+        self.assertEqual(rep["retries"], 1); self.assertEqual(rep["steps"]["draft"]["retries"], 1)
+        self.assertEqual(rep["steps"]["draft"]["review"], 2); self.assertEqual(rep["steps"]["send"]["work"], 2)
+        self.assertEqual(json.loads(self.flow("report", "other")), {})
+        self.assertEqual(json.loads(self.flow("report", "--since", "2999-01-01")), {})
+
     def test_items_without_a_key_get_unique_ids(self):
         ids = {json.loads(self.flow("add", "reply", "{}"))["added"] for _ in range(5)}
         self.assertEqual(len(ids), 5)
