@@ -435,6 +435,12 @@ class Cli(Base):
         self.add(); out = json.loads(self.flow("add", "reply", "{}", "--key", "i1"))
         self.assertEqual(out, {"exists": "i1"})
 
+    def test_add_can_start_an_item_at_a_later_step(self):
+        self.flow("add", "reply", '{"name": "Sam"}', "--key", "s", "--step", "send")
+        self.assertEqual(self.state("s")["step"], "send")
+        self.script(SENT); self.tick(); self.assertEqual(self.state("s")["status"], "done")
+        p = self.run_flow("add", "reply", "{}", "--step", "nope"); self.assertEqual(p.returncode, 2); self.assertIn("no step", p.stdout)
+
     def test_items_without_a_key_get_unique_ids(self):
         ids = {json.loads(self.flow("add", "reply", "{}"))["added"] for _ in range(5)}
         self.assertEqual(len(ids), 5)

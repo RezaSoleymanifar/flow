@@ -6,7 +6,7 @@ A WORKFLOW wires blocks into a graph: workflows/<name>.yaml. An ITEM is one unit
 Every item-step pair keeps its own Claude session (its own conversation history); the item's state file holds the
 pointers. Retry, loop back and jump are all the same move: point the item at a step, resume that step's session.
 
-  flow add WORKFLOW [JSON] [--key K]   new item at the start step; JSON becomes data.input; --key dedupes
+  flow add WORKFLOW [JSON] [--key K] [--step S]   new item (at the start step, or S); JSON becomes data.input; --key dedupes
   flow tick [WORKFLOW]                 run every ready item until it ends, waits at a gate or gets stuck
   flow status [WORKFLOW]               one JSON line per item
   flow show ITEM                       one item's whole state
@@ -449,15 +449,17 @@ def main(a):
     cmd, rest = a[0], a[1:]
     try:
         if cmd == "add":
-            key = None
-            if "--key" in rest:
-                i = rest.index("--key")
-                if i + 1 >= len(rest): die("--key needs a value")
-                key = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
-            if not rest: die("usage: flow add WORKFLOW [JSON] [--key K]")
+            opts = {}
+            for o in ("--key", "--step"):
+                if o in rest:
+                    i = rest.index(o)
+                    if i + 1 >= len(rest): die("%s needs a value" % o)
+                    opts[o] = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
+            if not rest: die("usage: flow add WORKFLOW [JSON] [--key K] [--step S]")
             try: inp = json.loads(rest[1]) if len(rest) > 1 else {}
             except ValueError: die("input is not valid JSON")
-            st = new_item(rest[0], inp, key)
+            if "--step" in opts and opts["--step"] not in workflow(rest[0])["steps"]: die("no step %r in %s" % (opts["--step"], rest[0]))
+            key = opts.get("--key"); st = new_item(rest[0], inp, key, opts.get("--step"))
             print(json.dumps({"added": st["id"]} if st else {"exists": safe_id(key)})); return 0
         if cmd == "tick": print(json.dumps(tick(rest[0] if rest else None))); return 0
         if cmd == "status":
