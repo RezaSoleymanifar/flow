@@ -50,6 +50,30 @@ class Live(unittest.TestCase):
         out, _ = self.ask("Use the Read tool on ./secret.txt and put its exact contents in answer.", tools=["Read"])
         self.assertIn(secret, out["answer"])
 
+    def test_parallel_items_get_distinct_real_sessions(self):
+        """Three real items at once through the engine: distinct sessions, all done, faster than serial."""
+        import subprocess, time
+        home = tempfile.mkdtemp(); runs = tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, "blocks", "echo")); os.makedirs(os.path.join(home, "workflows"))
+        with open(os.path.join(home, "blocks", "echo", "block.yaml"), "w") as f:
+            f.write(json.dumps({"output": ANSWER, "tools": []}))
+        with open(os.path.join(home, "blocks", "echo", "prompt.md"), "w") as f:
+            f.write("Put the item's word, unchanged, in answer.")
+        with open(os.path.join(home, "workflows", "p.yaml"), "w") as f: f.write("start: a\nsteps:\n  a: {block: echo}\n")
+        env = dict(os.environ, FLOW_HOME=home, FLOW_RUNS=runs, FLOW_PARALLEL="3")
+        F = os.path.join(os.path.dirname(HERE), "flow.py")
+        for w in ("alpha", "bravo", "charlie"):
+            subprocess.run([sys.executable, F, "add", "p", json.dumps({"word": w}), "--key", w], env=env, check=True, capture_output=True)
+        t0 = time.time(); subprocess.run([sys.executable, F, "tick"], env=env, check=True, capture_output=True); dt = time.time() - t0
+        states = [json.loads(subprocess.run([sys.executable, F, "show", w], env=env, capture_output=True, text=True).stdout) for w in ("alpha", "bravo", "charlie")]
+        self.assertEqual([s["status"] for s in states], ["done"] * 3)
+        self.assertEqual(len({s["sessions"]["a"] for s in states}), 3)
+        for s in states: self.assertIn(s["data"]["input"]["word"], s["data"]["a"]["answer"].lower())
+        with open(os.path.join(runs, "events.jsonl")) as f: works = [json.loads(l) for l in f if '"work"' in l]
+        self.assertEqual(len(works), 3)
+        print("\n3 parallel real items took %.1fs" % dt)
+        shutil.rmtree(home); shutil.rmtree(runs)
+
     @unittest.skipUnless(os.environ.get("FLOW_LIVE_SANDBOX") == "1", "set FLOW_LIVE_SANDBOX=1 after setup.sh")
     def test_sandbox_cannot_write_outside_its_folder(self):
         target = os.path.join(os.environ.get("FLOW_RUNS", "/var/lib/flow/runs"), "escape-%s" % uuid.uuid4().hex[:6])
