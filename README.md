@@ -29,6 +29,9 @@ in status `external` until `flow done ITEM JSON` or `flow fail ITEM REASON` brin
 through the same format check, check script and reviewer as a worker's answer. This is how a step that needs a
 logged-in browser or a person plugs into an otherwise headless workflow.
 
+A check script exits 0 to pass, 1 to fail with a reason the worker can fix (printed on stdout), or 2 to fail for a
+reason no retry can change, such as a do-not-contact rule: the item stops at once.
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the

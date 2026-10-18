@@ -40,6 +40,10 @@ REVIEW_SCHEMA = {"type": "object", "required": ["pass", "notes"],
 os.umask(0o027)   # state is readable by the sandbox group, writable only by the runner
 
 
+class FinalFail(str):
+    """A check verdict that no retry can change (a hard rule). The item stops at once."""
+
+
 class ConfigError(Exception):
     """A workflow or block is broken. The item stops with the reason; the runner keeps going."""
 
@@ -216,7 +220,9 @@ def run_check(b, out, st, cwd):
                            text=True, cwd=cwd, timeout=300)
     except subprocess.TimeoutExpired: return "check failed: the check timed out"
     except OSError as e: raise ConfigError("check script could not run: %s" % e)
-    return None if p.returncode == 0 else ("check failed: " + (p.stdout.strip() or p.stderr.strip()[-400:] or "no reason given"))
+    if p.returncode == 0: return None
+    reason = "check failed: " + (p.stdout.strip() or p.stderr.strip()[-400:] or "no reason given")
+    return FinalFail(reason) if p.returncode == 2 else reason   # exit 2: nothing a retry could fix
 
 def review(b, out, st, cwd):
     if not b.get("review"): return None
@@ -260,6 +266,7 @@ def judge(wf, st, step, b, cwd, out, reason):
     if reason:
         st["attempt"] += 1; st["reason"] = reason
         st["feedback"] = "Your last answer failed. %s. Fix that." % reason
+        if isinstance(reason, FinalFail): return stop(st, "stopped by a hard rule: " + reason)
         if b.get("once"): return stop(st, "a run-once step failed, so it is not retried on its own: " + reason)
         if st["attempt"] >= wf["max_attempts"]: return stop(st, reason)
         st["status"] = "ready"; event(st, "retry", reason=reason); save(st); return

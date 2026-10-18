@@ -206,6 +206,13 @@ class Failures(Base):
         self.add(); self.script({"__raw": "Sure! Here is a reply."}, GOOD, PASS, SENT); self.tick()
         self.assertIn("not JSON", self.calls()[1]["msg"])
 
+    def test_check_exit_2_stops_the_item_without_retrying(self):
+        self.block("draft", {"output": {"type": "object"}, "check": "check.py"},
+                   check="print('on the do-not-contact list'); raise SystemExit(2)\n")
+        self.add(); self.script({}, {}, {}); self.tick()
+        st = self.state("i1"); self.assertEqual((st["status"], st["attempt"]), ("stuck", 1))
+        self.assertIn("hard rule", st["reason"]); self.assertEqual(len(self.calls()), 1)
+
     def test_check_that_crashes_counts_as_failure_with_its_error(self):
         self.block("draft", {"output": {"type": "object"}, "check": "check.py"}, check="raise SystemExit('boom')\n")
         self.add(); self.script({}, {}, {}); self.tick()
