@@ -1,0 +1,6 @@
+start: greet
+steps:
+  greet:
+    block: smoke
+    routes:
+      - to: end

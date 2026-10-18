@@ -1,0 +1,7 @@
+# Smoke test: proves a sandboxed session runs, answers in format, and passes a reviewer.
+output:
+  type: object
+  required: [greeting]
+  properties: {greeting: {type: string}}
+tools: []
+review: The greeting is one short friendly sentence that uses the name from the item input.
