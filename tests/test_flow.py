@@ -1,188 +1,424 @@
-"""Behavior tests for flow, run against a fake claude. python3 -m unittest discover -s tests"""
-import json, os, shutil, subprocess, sys, tempfile, textwrap, unittest
+"""Behavior and edge-case tests, run against the realistic fake claude. python3 -m unittest discover -s tests"""
+import fcntl, json, os, re, sys, unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-FLOW = os.path.join(HERE, "..", "flow.py")
-FAKE = os.path.join(HERE, "fake_claude.py")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from base import Base, GOOD, PASS, SENT  # noqa: E402
 
-DRAFT = {"type": "object", "required": ["intent", "text"],
-         "properties": {"intent": {"type": "string"}, "text": {"type": "string"}}}
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
 
-class Base(unittest.TestCase):
-    def setUp(self):
-        self.home = tempfile.mkdtemp(); self.fake = tempfile.mkdtemp()
-        open(os.path.join(self.fake, "script.json"), "w").write("[]")
-        self.env = dict(os.environ, FLOW_HOME=self.home, FAKE_DIR=self.fake,
-                        FLOW_CLAUDE="%s %s" % (sys.executable, FAKE))
-        self.block("draft", {"output": DRAFT, "tools": ["Read"],
-                             "check": "check.py", "review": "The text must be polite."},
-                   check="import json,sys; d=json.load(sys.stdin)\n"
-                         "if '-' in d['out']['text']: print('no dashes allowed'); sys.exit(1)\n")
-        self.block("send", {"output": {"type": "object", "required": ["sent"],
-                                       "properties": {"sent": {"type": "boolean"}}}, "once": True})
-        self.block("archive", {"output": {"type": "object"}})
+class Routing(Base):
+    def test_happy_path_routes_by_condition_and_carries_data(self):
+        self.add(); self.script(GOOD, PASS, SENT); self.tick()
+        st = self.state("i1")
+        self.assertEqual((st["status"], st["step"]), ("done", "send"))
+        self.assertEqual(st["data"]["draft"], GOOD)
+        self.assertIn('"name": "Sam"', self.calls()[0]["msg"])
+        self.assertIn('"intent": "reply"', self.calls()[2]["msg"])        # the next step sees earlier answers
+
+    def test_condition_sends_to_another_branch(self):
+        self.add(); self.script({"intent": "decline", "text": "no thanks"}, PASS, {}); self.tick()
+        self.assertEqual((self.state("i1")["step"], self.state("i1")["status"]), ("archive", "done"))
+
+    def test_condition_on_a_missing_field_is_just_false(self):
         self.workflow("reply", """
             start: draft
             steps:
               draft:
                 block: draft
                 routes:
-                  - when: out.intent == "decline"
+                  - when: out.nothing.deeper == "x"
                     to: archive
-                  - to: send
-              send:
-                block: send
-                routes: [{to: end}]
+                  - to: end
+              archive: {block: archive}
+        """)
+        self.add(); self.script(GOOD, PASS); self.tick()
+        self.assertEqual((self.state("i1")["step"], self.state("i1")["status"]), ("draft", "done"))
+
+    def test_condition_can_read_earlier_steps_through_data(self):
+        self.workflow("reply", """
+            start: draft
+            steps:
+              draft:
+                block: draft
+                routes: [{to: archive}]
               archive:
                 block: archive
-                routes: [{to: end}]
+                routes:
+                  - when: data.input.name == "Sam" and len(data.draft.text) > 5
+                    to: send
+                  - to: end
+              send: {block: send, routes: [{to: end}]}
         """)
+        self.add(); self.script(GOOD, PASS, {}, SENT); self.tick()
+        self.assertEqual(self.state("i1")["step"], "send")
 
-    def tearDown(self): shutil.rmtree(self.home); shutil.rmtree(self.fake)
+    def test_condition_that_errors_stops_the_item_not_the_runner(self):
+        self.workflow("reply", """
+            start: draft
+            steps:
+              draft:
+                block: draft
+                routes:
+                  - when: out.text > 5
+                    to: end
+                  - to: end
+        """)
+        self.add(key="a"); self.add(key="b", wf="reply"); self.script(GOOD, PASS, GOOD, PASS); self.tick()
+        for k in ("a", "b"):
+            st = self.state(k); self.assertEqual(st["status"], "stuck"); self.assertIn("route condition failed", st["reason"])
 
-    def block(self, name, cfg, check=None):
-        d = os.path.join(self.home, "blocks", name); os.makedirs(d)
-        open(os.path.join(d, "prompt.md"), "w").write("Do the %s step." % name)
-        open(os.path.join(d, "block.yaml"), "w").write(json.dumps(cfg))
-        if check: open(os.path.join(d, "check.py"), "w").write(check)
+    def test_no_matching_route_is_stuck(self):
+        self.workflow("reply", """
+            start: draft
+            steps:
+              draft:
+                block: draft
+                routes:
+                  - when: out.intent == "never"
+                    to: end
+        """)
+        self.add(); self.script(GOOD, PASS); self.tick()
+        self.assertEqual(self.state("i1")["reason"], "no route matched")
 
-    def workflow(self, name, text):
-        os.makedirs(os.path.join(self.home, "workflows"), exist_ok=True)
-        open(os.path.join(self.home, "workflows", name + ".yaml"), "w").write(textwrap.dedent(text))
+    def test_a_step_without_routes_ends(self):
+        self.workflow("reply", "start: draft\nsteps:\n  draft: {block: archive}\n")
+        self.add(); self.script({}); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
 
-    def script(self, *answers): json.dump(list(answers), open(os.path.join(self.fake, "script.json"), "w"))
+    def test_loop_without_a_gate_is_stopped(self):
+        self.workflow("reply", """
+            start: a
+            max_steps: 5
+            steps:
+              a: {block: archive, routes: [{to: a}]}
+        """)
+        self.add(); self.script(*([{}] * 20)); self.tick()
+        st = self.state("i1"); self.assertEqual(st["status"], "stuck"); self.assertIn("5 step limit", st["reason"])
+        self.assertEqual(len(self.calls()), 5)
 
-    def flow(self, *args, ok=True):
-        p = subprocess.run([sys.executable, FLOW] + list(args), env=self.env, capture_output=True, text=True)
-        if ok: self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        return p.stdout
-
-    def calls(self):
-        p = os.path.join(self.fake, "calls.jsonl")
-        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
-
-    def state(self, iid): return json.loads(self.flow("show", iid))
-
-    def add(self, inp=None, key="i1", wf="reply"):
-        self.flow("add", wf, json.dumps(inp or {"name": "Sam"}), "--key", key); return key
-
-
-GOOD = {"intent": "reply", "text": "Thanks Sam, happy to talk."}
-PASS = {"pass": True, "notes": ""}
+    def test_unicode_passes_through(self):
+        self.add({"name": "Zoë 李"}); self.script(GOOD, PASS, SENT); self.tick()
+        self.assertIn("Zoë 李", self.calls()[0]["msg"])
 
 
-class Behaviors(Base):
-    def test_happy_path_routes_by_condition_and_carries_data(self):
-        self.add(); self.script(GOOD, PASS, {"sent": True}); self.flow("tick")
-        st = self.state("i1")
-        self.assertEqual((st["status"], st["step"]), ("done", "send"))
-        self.assertEqual(st["data"]["draft"], GOOD)
-        self.assertIn('"name": "Sam"', self.calls()[0]["msg"])          # the item's data reaches the worker
-
-    def test_condition_sends_to_another_branch(self):
-        self.add(); self.script({"intent": "decline", "text": "no thanks"}, PASS, {}); self.flow("tick")
-        self.assertEqual(self.state("i1")["step"], "archive")
-
+class Sessions(Base):
     def test_each_item_step_has_its_own_session_and_reviewer_is_fresh(self):
-        self.add(); self.script(GOOD, PASS, {"sent": True}); self.flow("tick")
+        self.add(); self.script(GOOD, PASS, SENT); self.tick()
         c = self.calls(); st = self.state("i1")
-        self.assertEqual(st["sessions"]["draft"], c[0]["session_id"])
-        self.assertEqual(st["sessions"]["send"], c[2]["session_id"])
-        self.assertNotIn(c[1]["session_id"], st["sessions"].values())   # reviewer is not a worker session
-        self.assertIsNone(c[1]["resume"])
+        self.assertEqual(st["sessions"], {"draft": c[0]["session_id"], "send": c[2]["session_id"]})
+        self.assertIsNone(c[1]["resume"]); self.assertNotIn(c[1]["session_id"], st["sessions"].values())
 
-    def test_bad_format_retries_in_the_same_session_with_the_reason(self):
-        self.add(); self.script({"intent": "reply"}, GOOD, PASS, {"sent": True}); self.flow("tick")
+    def test_session_ids_are_uuids_and_never_reused_for_a_new_session(self):
+        for k in "abc": self.add(key=k)
+        self.script(*([GOOD, PASS, SENT] * 3)); self.tick()
+        new = [c["session_id"] for c in self.calls() if c["session_id"]]
+        self.assertEqual(len(new), len(set(new)))
+        self.assertTrue(all(UUID.match(s) for s in new))
+
+    def test_two_items_never_share_a_session_or_folder(self):
+        self.add(key="a"); self.add(key="b"); self.script(GOOD, PASS, SENT, GOOD, PASS, SENT); self.tick()
+        a, b = self.state("a"), self.state("b")
+        self.assertFalse(set(a["sessions"].values()) & set(b["sessions"].values()))
+        self.assertEqual(len({c["cwd"] for c in self.calls()}), 2)
+
+    def test_retry_resumes_the_same_conversation(self):
+        self.add(); self.script({"intent": "reply"}, GOOD, PASS, SENT); self.tick()
         c = self.calls()
-        self.assertEqual(c[1]["resume"], c[0]["session_id"])            # same conversation, resumed
-        self.assertIn("required format", c[1]["msg"])
-        self.assertEqual(self.state("i1")["status"], "done")
-
-    def test_check_failure_retries_with_check_reason(self):
-        self.add(); self.script({"intent": "reply", "text": "hi - there"}, GOOD, PASS, {"sent": True}); self.flow("tick")
-        self.assertIn("no dashes allowed", self.calls()[1]["msg"])
-        self.assertEqual(self.state("i1")["status"], "done")
-
-    def test_reviewer_failure_retries_with_its_notes(self):
-        self.add(); self.script(GOOD, {"pass": False, "notes": "too blunt"}, GOOD, PASS, {"sent": True}); self.flow("tick")
-        self.assertIn("too blunt", self.calls()[2]["msg"])
-        self.assertEqual(self.state("i1")["status"], "done")
-
-    def test_three_failures_make_it_stuck(self):
-        self.add(); self.script({"x": 1}, {"x": 1}, {"x": 1}); self.flow("tick")
-        st = self.state("i1"); self.assertEqual((st["status"], st["attempt"]), ("stuck", 3))
-        self.assertEqual(len(self.calls()), 3)
-
-    def test_gate_waits_then_approve_routes_on(self):
-        self.workflow("reply", open(os.path.join(self.home, "workflows", "reply.yaml")).read()
-                      .replace("block: draft\n", "block: draft\n    gate: true\n"))
-        self.add(); self.script(GOOD, PASS); self.flow("tick")
-        self.assertEqual(self.state("i1")["status"], "waiting")
-        self.flow("approve", "i1"); self.script({"sent": True}); self.flow("tick")
-        self.assertEqual(self.state("i1")["status"], "done")
-
-    def test_reject_resumes_the_step_session_with_the_note(self):
-        self.workflow("reply", open(os.path.join(self.home, "workflows", "reply.yaml")).read()
-                      .replace("block: draft\n", "block: draft\n    gate: true\n"))
-        self.add(); self.script(GOOD, PASS); self.flow("tick")
-        self.flow("reject", "i1", "mention", "the", "Ford", "work"); self.script(GOOD, PASS); self.flow("tick")
-        c = self.calls()
-        self.assertEqual(c[2]["resume"], c[0]["session_id"]); self.assertIn("mention the Ford work", c[2]["msg"])
+        self.assertEqual(c[1]["resume"], c[0]["session_id"])
+        self.assertEqual(c[1]["history"], 1)                              # the worker saw its first turn
 
     def test_jump_back_resumes_that_steps_own_session(self):
-        self.add(); self.script(GOOD, PASS, {"sent": True}); self.flow("tick")
-        self.flow("jump", "i1", "draft", "they", "replied", "again"); self.script(GOOD, PASS, {"sent": True}); self.flow("tick")
+        self.add(); self.script(GOOD, PASS, SENT); self.tick()
+        self.flow("jump", "i1", "draft", "they", "replied", "again"); self.script(GOOD, PASS, SENT); self.tick()
         c = self.calls()
-        self.assertEqual(c[3]["resume"], c[0]["session_id"]); self.assertIn("they replied again", c[3]["msg"])
-        self.assertEqual(c[5]["resume"], c[2]["session_id"])            # send's own session resumed too
+        self.assertEqual((c[3]["resume"], c[3]["history"]), (c[0]["session_id"], 1))
+        self.assertIn("they replied again", c[3]["msg"])
+        self.assertEqual(c[5]["resume"], c[2]["session_id"])
 
-    def test_fan_out_spawns_one_item_per_element_and_dedupes(self):
+    def test_a_lost_session_starts_fresh_instead_of_failing(self):
+        self.add(); self.script(GOOD, PASS, SENT); self.tick()
+        sid = self.state("i1")["sessions"]["draft"]
+        os.remove(os.path.join(self.fake, "sessions", sid + ".json"))    # e.g. the sandbox home was wiped
+        self.flow("jump", "i1", "draft"); self.script(GOOD, PASS, SENT); self.tick()
+        c = self.calls()
+        self.assertEqual(c[3]["resume"], sid)                              # tried to resume, got "No conversation found"
+        self.assertIsNone(c[4]["resume"]); self.assertIn("Do the draft step", c[4]["msg"])   # full prompt, fresh
+        self.assertEqual(self.state("i1")["status"], "done")
+        self.assertEqual(len(self.events("session_lost")), 1)
+
+    def test_a_failed_start_does_not_poison_the_next_attempt(self):
+        self.add(); self.script({"__error": "Not logged in · Please run /login"}, GOOD, PASS, SENT); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_resume_message_carries_feedback_and_current_data(self):
+        self.add(); self.script({"intent": "reply", "text": "a - b"}, GOOD, PASS, SENT); self.tick()
+        m = self.calls()[1]["msg"]
+        self.assertIn("no dashes allowed", m); self.assertIn('"name": "Sam"', m)
+
+
+class Failures(Base):
+    def test_bad_format_retries_with_the_reason(self):
+        self.add(); self.script({"intent": "reply"}, GOOD, PASS, SENT); self.tick()
+        self.assertIn("required format", self.calls()[1]["msg"]); self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_check_failure_retries_with_its_reason(self):
+        self.add(); self.script({"intent": "reply", "text": "hi - there"}, GOOD, PASS, SENT); self.tick()
+        self.assertIn("no dashes allowed", self.calls()[1]["msg"])
+
+    def test_reviewer_failure_retries_with_its_notes(self):
+        self.add(); self.script(GOOD, {"pass": False, "notes": "too blunt"}, GOOD, PASS, SENT); self.tick()
+        self.assertIn("too blunt", self.calls()[2]["msg"]); self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_reviewer_error_counts_as_a_failed_attempt(self):
+        self.add(); self.script(GOOD, {"__error": "overloaded"}, GOOD, PASS, SENT); self.tick()
+        self.assertIn("reviewer could not answer", self.calls()[2]["msg"])
+
+    def test_three_failures_make_it_stuck_and_stop_calling(self):
+        self.add(); self.script({"x": 1}, {"x": 1}, {"x": 1}, GOOD); self.tick()
+        st = self.state("i1"); self.assertEqual((st["status"], st["attempt"]), ("stuck", 3))
+        self.assertEqual(len(self.calls()), 3); self.assertEqual(len(self.left()), 1)
+
+    def test_max_attempts_is_configurable(self):
+        self.workflow("reply", "start: draft\nmax_attempts: 1\nsteps:\n  draft: {block: draft}\n")
+        self.add(); self.script({"x": 1}); self.tick()
+        self.assertEqual(self.state("i1")["status"], "stuck")
+
+    def test_claude_crash_without_json_is_retried(self):
+        self.add(); self.script({"__crash": "segfault", "code": 139}, GOOD, PASS, SENT); self.tick()
+        self.assertIn("no JSON", self.calls()[1]["msg"]); self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_claude_error_subtype_is_retried(self):
+        self.add(); self.script({"__subtype": "error_max_structured_output_retries"}, GOOD, PASS, SENT); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_timeout_is_retried(self):
+        env = dict(self.env, FLOW_TIMEOUT="1")
+        self.add(); self.script({"__sleep": 3}, GOOD, PASS, SENT)
+        p = self.run_flow("tick", env=env); self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("timed out", self.calls()[1]["msg"] if len(self.calls()) > 1 else self.state("i1")["reason"])
+
+    def test_plain_json_text_and_code_fences_are_accepted(self):
+        self.add(); self.script({"__raw": "```json\n" + json.dumps(GOOD) + "\n```"}, PASS, SENT); self.tick()
+        self.assertEqual(self.state("i1")["data"]["draft"], GOOD)
+
+    def test_plain_prose_is_a_format_failure(self):
+        self.add(); self.script({"__raw": "Sure! Here is a reply."}, GOOD, PASS, SENT); self.tick()
+        self.assertIn("not JSON", self.calls()[1]["msg"])
+
+    def test_check_that_crashes_counts_as_failure_with_its_error(self):
+        self.block("draft", {"output": {"type": "object"}, "check": "check.py"}, check="raise SystemExit('boom')\n")
+        self.add(); self.script({}, {}, {}); self.tick()
+        st = self.state("i1"); self.assertEqual(st["status"], "stuck"); self.assertIn("boom", st["reason"])
+
+    def test_missing_check_script_stops_only_that_item(self):
+        self.block("draft", {"output": {"type": "object"}, "check": "gone.py"})
+        self.workflow("other", "start: a\nsteps:\n  a: {block: archive}\n")
+        self.add(key="bad"); self.add(key="good", wf="other"); self.script({}, {}); self.tick()
+        self.assertIn("missing", self.state("bad")["reason"]); self.assertEqual(self.state("good")["status"], "done")
+
+    def test_missing_block_stops_only_that_item(self):
+        self.workflow("broken", "start: a\nsteps:\n  a: {block: nope}\n")
+        self.add(key="x", wf="broken"); self.add(key="y"); self.script(GOOD, PASS, SENT); self.tick()
+        self.assertIn("no block", self.state("x")["reason"]); self.assertEqual(self.state("y")["status"], "done")
+
+
+class OnceSteps(Base):
+    def test_a_once_step_that_fails_is_never_retried_on_its_own(self):
+        self.add(); self.script(GOOD, PASS, {"sent": "maybe"}, SENT); self.tick()
+        st = self.state("i1"); self.assertEqual((st["status"], st["step"]), ("stuck", "send"))
+        self.assertIn("run-once", st["reason"]); self.assertEqual(len(self.calls()), 3)
+
+    def test_crash_mid_step_reruns_normal_steps_but_never_once_steps(self):
+        self.add(key="a"); self.add(key="b")
+        self.edit_state("a", status="running", step="draft"); self.edit_state("b", status="running", step="send")
+        self.script(GOOD, PASS, SENT); self.tick()
+        self.assertEqual(self.state("a")["status"], "done"); self.assertEqual(self.state("b")["status"], "stuck")
+
+    def test_a_human_can_rerun_a_stuck_once_step_by_jumping(self):
+        self.add(); self.edit_state("i1", status="stuck", step="send")
+        self.flow("jump", "i1", "send"); self.script(SENT); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
+
+
+class Gates(Base):
+    def test_gate_waits_then_approve_routes_on(self):
+        self.gate_draft(); self.add(); self.script(GOOD, PASS); self.tick()
+        self.assertEqual(self.state("i1")["status"], "waiting")
+        self.tick(); self.assertEqual(len(self.calls()), 2)              # a waiting item is left alone
+        self.flow("approve", "i1"); self.script(SENT); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_approve_follows_conditions_on_the_gated_answer(self):
+        self.gate_draft(); self.add(); self.script({"intent": "decline", "text": "no"}, PASS); self.tick()
+        self.flow("approve", "i1"); self.script({}); self.tick()
+        self.assertEqual(self.state("i1")["step"], "archive")
+
+    def test_reject_resumes_the_step_session_with_the_note(self):
+        self.gate_draft(); self.add(); self.script(GOOD, PASS); self.tick()
+        self.flow("reject", "i1", "mention", "the", "Ford", "work"); self.script(GOOD, PASS); self.tick()
+        c = self.calls()
+        self.assertEqual(c[2]["resume"], c[0]["session_id"]); self.assertIn("mention the Ford work", c[2]["msg"])
+        self.assertEqual(self.state("i1")["status"], "waiting")
+
+    def test_approve_or_reject_needs_a_waiting_item(self):
+        self.add()
+        for cmd in (["approve", "i1"], ["reject", "i1", "no"]):
+            p = self.run_flow(*cmd); self.assertEqual(p.returncode, 2); self.assertIn("not waiting", p.stdout)
+
+
+class FanOut(Base):
+    def setUp(self):
+        super().setUp()
         self.block("find", {"output": {"type": "object"}})
         self.workflow("follow", """
             start: find
             steps:
               find:
                 block: find
-                routes: [{each: out.replies, to: draft}]
-              draft:
+                routes: [{each: out.replies, to: handle}]
+              handle:
                 block: archive
                 routes: [{to: end}]
         """)
+
+    def test_one_item_per_element_and_no_duplicates_on_rerun(self):
         found = {"replies": [{"key": "t1", "from": "A"}, {"key": "t2", "from": "B"}]}
-        self.add(key="night1", wf="follow"); self.script(found, {}, {}); self.flow("tick")
-        ids = {json.loads(l)["id"]: json.loads(l)["status"] for l in self.flow("status", "follow").splitlines()}
-        self.assertEqual(ids, {"night1": "done", "t1": "done", "t2": "done"})
+        self.add(key="night1", wf="follow"); self.script(found, {}, {}); self.tick()
+        self.assertEqual(self.statuses("follow"), {"night1": "done", "t1": "done", "t2": "done"})
+        self.assertEqual(self.state("t1")["data"]["input"], {"key": "t1", "from": "A"})
         n = len(self.calls())
-        self.add(key="night2", wf="follow"); self.script(found); self.flow("tick")   # same replies found again
-        ids = [json.loads(l)["id"] for l in self.flow("status", "follow").splitlines()]
-        self.assertEqual(sorted(ids), ["night1", "night2", "t1", "t2"])            # no duplicate t1/t2
-        self.assertEqual(len(self.calls()), n + 1)                                  # only night2's find ran
+        self.add(key="night2", wf="follow"); self.script(found); self.tick()
+        self.assertEqual(sorted(self.statuses("follow")), ["night1", "night2", "t1", "t2"])
+        self.assertEqual(len(self.calls()), n + 1)
 
+    def test_empty_list_finishes_without_children(self):
+        self.add(key="n", wf="follow"); self.script({"replies": []}); self.tick()
+        self.assertEqual(self.statuses("follow"), {"n": "done"})
+
+    def test_missing_list_counts_as_empty(self):
+        self.add(key="n", wf="follow"); self.script({}); self.tick()
+        self.assertEqual(self.statuses("follow"), {"n": "done"})
+
+    def test_not_a_list_stops_the_item(self):
+        self.add(key="n", wf="follow"); self.script({"replies": "oops"}); self.tick()
+        self.assertIn("not a list", self.state("n")["reason"])
+
+    def test_elements_without_keys_get_stable_ids(self):
+        self.add(key="n", wf="follow"); self.script({"replies": ["x", 3]}, {}, {}); self.tick()
+        self.assertEqual(sorted(self.statuses("follow")), ["n", "n-0", "n-1"])
+
+    def test_hostile_keys_stay_inside_the_runs_folder(self):
+        self.add(key="n", wf="follow"); self.script({"replies": [{"key": "../../etc/x"}]}, {}); self.tick()
+        ids = [i for i in self.statuses("follow") if i != "n"]
+        self.assertEqual(len(ids), 1); self.assertNotIn("/", ids[0]); self.assertFalse(ids[0].startswith("."))
+
+
+class Safety(Base):
     def test_tools_are_limited_per_block(self):
-        self.add(); self.script(GOOD, PASS, {"sent": True}); self.flow("tick")
+        self.add(); self.script(GOOD, PASS, SENT); self.tick()
         c = self.calls()
-        self.assertEqual((c[0]["tools"], c[0]["allowed"]), ("Read", "Read"))
-        self.assertEqual(c[1]["tools"], "")                              # reviewer gets no tools
-        self.assertEqual(c[2]["tools"], "")
+        self.assertEqual((c[0]["tools"], c[0]["allowed"], c[0]["permission"]), ("Read", "Read", "dontAsk"))
+        self.assertEqual((c[1]["tools"], c[1]["allowed"]), ("", None))     # reviewer: no tools at all
+        self.assertEqual((c[2]["tools"], c[2]["allowed"]), ("", None))
 
-    def test_each_item_works_in_its_own_folder(self):
-        self.add(key="a"); self.add(key="b"); self.script(GOOD, PASS, {"sent": True}, GOOD, PASS, {"sent": True})
-        self.flow("tick")
-        cwds = {c["cwd"] for c in self.calls()}
-        self.assertEqual(len(cwds), 2)
+    def test_model_and_mcp_servers_are_passed_and_allowed(self):
+        self.block("archive", {"output": {"type": "object"}, "model": "sonnet",
+                               "mcp": {"mail": {"command": "mail-mcp"}}})
+        self.workflow("reply", "start: a\nsteps:\n  a: {block: archive}\n")
+        self.add(); self.script({}); self.tick()
+        c = self.calls()[0]
+        self.assertEqual(c["model"], "sonnet"); self.assertEqual(c["allowed"], "mcp__mail")
+        self.assertEqual(json.loads(c["mcp"]), {"mcpServers": {"mail": {"command": "mail-mcp"}}})
 
-    def test_crash_mid_step_reruns_normal_steps_but_never_once_steps(self):
+    def test_the_answer_reaches_checks_only_as_data(self):
+        self.block("draft", {"output": DRAFT_ANY, "check": "check.py"},
+                   check="import json,sys\nd=json.load(sys.stdin)\nopen('seen.json','w').write(json.dumps(d))\n")
+        self.workflow("reply", "start: draft\nsteps:\n  draft: {block: draft}\n")
+        self.add(); self.script({"intent": "$(rm -rf /)", "text": "`x`"}); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_work_folders_are_private_to_the_group(self):
+        self.add(); self.script(GOOD, PASS, SENT); self.tick()
+        mode = os.stat(os.path.join(self.home, "runs", "reply", "i1", "work")).st_mode & 0o7777
+        self.assertEqual(mode, 0o2770)
+
+
+DRAFT_ANY = {"type": "object"}
+
+
+class Runner(Base):
+    def test_unreadable_state_is_reported_and_skipped(self):
         self.add(key="a"); self.add(key="b")
-        for iid, step in (("a", "draft"), ("b", "send")):
-            p = os.path.join(self.home, "runs", "reply", iid, "state.json")
-            st = json.load(open(p)); st.update(status="running", step=step); json.dump(st, open(p, "w"))
-        self.script(GOOD, PASS, {"sent": True}); self.flow("tick")
-        self.assertEqual(self.state("a")["status"], "done")
-        self.assertEqual(self.state("b")["status"], "stuck")
+        with open(self.state_path("a"), "w") as f: f.write("{not json")
+        self.script(GOOD, PASS, SENT); res = self.tick()
+        self.assertEqual(res["unreadable"], ["reply/a"]); self.assertEqual(self.state("b")["status"], "done")
 
-    def test_validate_rejects_unsafe_conditions_and_bad_routes(self):
-        self.workflow("bad", """
+    def test_a_second_tick_while_one_runs_is_skipped(self):
+        os.makedirs(os.path.join(self.home, "runs"), exist_ok=True)
+        with open(os.path.join(self.home, "runs", ".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertIn("skipped", self.tick())
+
+    def test_jumping_a_running_item_is_refused(self):
+        self.add(); self.edit_state("i1", status="running")
+        p = self.run_flow("jump", "i1", "send"); self.assertEqual(p.returncode, 2)
+
+    def test_stuck_item_can_be_jumped_back_to_ready(self):
+        self.add(); self.script({"x": 1}, {"x": 1}, {"x": 1}); self.tick()
+        self.flow("jump", "i1", "draft", "try", "again"); self.script(GOOD, PASS, SENT); self.tick()
+        self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_events_record_every_transition(self):
+        self.add(); self.script({"x": 1}, GOOD, PASS, SENT); self.tick()
+        kinds = [e["event"] for e in self.events()]
+        for k in ("added", "work", "retry", "review", "route", "done"): self.assertIn(k, kinds)
+
+    def test_record_mode_saves_raw_replies(self):
+        rec = os.path.join(self.fake, "rec"); env = dict(self.env, FLOW_RECORD=rec)
+        self.add(); self.script(GOOD, PASS, SENT); self.run_flow("tick", env=env)
+        files = os.listdir(rec); self.assertEqual(len(files), 3)
+        with open(os.path.join(rec, sorted(files)[0])) as f: r = json.load(f)
+        self.assertIn("stdout", r); self.assertIn("--session-id", r["argv"])
+
+
+class Cli(Base):
+    def err(self, *args):
+        p = self.run_flow(*args); self.assertEqual(p.returncode, 2, p.stdout); return json.loads(p.stdout)["error"]
+
+    def test_errors_are_json_and_exit_2(self):
+        self.assertIn("no workflow", self.err("add", "nope", "{}"))
+        self.assertIn("not valid JSON", self.err("add", "reply", "{bad"))
+        self.assertIn("--key needs a value", self.err("add", "reply", "{}", "--key"))
+        self.assertIn("no item", self.err("show", "ghost"))
+        self.add(); self.assertIn("steps", self.err("jump", "i1", "nowhere"))
+        self.assertIn("unknown command", self.err("dance"))
+
+    def test_adding_the_same_key_twice_is_a_no_op(self):
+        self.add(); out = json.loads(self.flow("add", "reply", "{}", "--key", "i1"))
+        self.assertEqual(out, {"exists": "i1"})
+
+    def test_items_without_a_key_get_unique_ids(self):
+        ids = {json.loads(self.flow("add", "reply", "{}"))["added"] for _ in range(5)}
+        self.assertEqual(len(ids), 5)
+
+    def test_status_filters_by_workflow(self):
+        self.workflow("other", "start: a\nsteps:\n  a: {block: archive}\n")
+        self.add(key="a"); self.add(key="b", wf="other")
+        self.assertEqual(list(self.statuses("other")), ["b"])
+
+
+class Validate(Base):
+    def problems(self, text, name="w"):
+        self.workflow(name, text); p = self.run_flow("validate", name)
+        return json.loads(p.stdout)[name]
+
+    def test_good_workflow_has_no_problems(self):
+        self.assertEqual(json.loads(self.flow("validate", "reply"))["reply"], [])
+
+    def test_catches_every_kind_of_mistake(self):
+        self.block("badschema", {"output": {"type": "nonsense"}})
+        out = self.problems("""
             start: a
             steps:
               a:
@@ -190,11 +426,21 @@ class Behaviors(Base):
                 routes:
                   - when: __import__("os").system("x")
                     to: nowhere
+              b: {block: missing}
+              c: {block: badschema}
+              d:
+                block: archive
+                routes:
+                  - when: out.x ==
+                    to: end
         """)
-        out = json.loads(self.flow("validate", "bad", ok=False))["bad"]
-        self.assertTrue(any("only len()" in e or "not allowed" in e for e in out), out)
-        self.assertTrue(any("unknown step" in e for e in out), out)
-        self.assertEqual(json.loads(self.flow("validate", "reply"))["reply"], [])
+        text = "\n".join(out)
+        for needle in ("only len()", "unknown step 'nowhere'", "no block 'missing'", "not a valid schema",
+                       "not a valid expression", "add a default route"):
+            self.assertIn(needle, text)
+
+    def test_bad_start_is_caught(self):
+        self.assertTrue(self.problems("start: x\nsteps:\n  a: {block: archive}\n"))
 
 
 if __name__ == "__main__":

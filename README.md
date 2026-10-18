@@ -50,5 +50,24 @@ flow status | flow show ITEM
 flow approve ITEM | flow reject ITEM NOTE | flow jump ITEM STEP [NOTE]
 ```
 
-Every command prints JSON, so an agent can operate it. Tests run against a fake Claude:
-`python3 -m unittest discover -s tests`
+Every command prints JSON, so an agent can operate it.
+
+## Tests
+
+Three layers, so the fake can never drift from the real thing:
+
+- `tests/test_flow.py`: every behavior and failure case, against `tests/fake_claude.py`, a fake that behaves like the
+  real CLI where the runner depends on it: the same reply fields, real session files, and the same errors for a
+  missing session, a reused or malformed session ID, and an unknown flag.
+- `tests/test_contract.py`: real replies captured from Claude Code (`tests/fixtures/`) parse correctly, the fake fails
+  exactly like the real CLI, and every flag the runner passes exists in the installed `claude` (runs wherever one is
+  installed; no login needed).
+- `tests/test_live.py`: the same core behaviors against real Claude (structured output, resume memory, tool limits,
+  sandbox escape attempts). Opt in with `FLOW_LIVE=1`; add `FLOW_RECORD=tests/fixtures/recorded` to keep the raw
+  replies, which the contract tests then check too.
+
+```
+python3 -m unittest discover -s tests                     # fake + contract
+FLOW_LIVE=1 FLOW_LIVE_SANDBOX=1 FLOW_CLAUDE="sudo -n -u flowagent /usr/local/bin/flow-claude" \
+  FLOW_RECORD=tests/fixtures/recorded python3 -m unittest tests.test_live
+```
