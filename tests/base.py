@@ -34,7 +34,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(); self.fake = tempfile.mkdtemp()
         self.script()
-        self.env = dict(os.environ, FLOW_HOME=self.home, FAKE_DIR=self.fake,
+        self.env = dict(os.environ, FLOW_HOME=self.home, FAKE_DIR=self.fake, FLOW_PARALLEL="1",   # scripted answers are ordered
                         FLOW_CLAUDE="%s %s" % (sys.executable, FAKE))
         self.env.pop("FLOW_RUNS", None); self.env.pop("FLOW_RECORD", None)
         self.block("draft", {"output": DRAFT, "tools": ["Read"], "check": "check.py",

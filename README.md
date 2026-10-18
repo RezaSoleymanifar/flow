@@ -36,6 +36,11 @@ A **record** script (`record: record.py` in block.yaml) runs after a step passes
 the answer and the item's data on stdin and writes whatever the workflow must never forget (a message sent, a
 verdict) to the workflow's own store, such as a database. If it fails, the item stops: nothing moves on unrecorded.
 
+**Parallelism** is not in the workflow files. The engine runs up to `FLOW_PARALLEL` (default 4) ready items at
+once, oldest first; each still gets its own session, checks, reviewer and record. A block with `lane: <name>` runs
+one item at a time in that lane, for a resource that cannot be shared (a logged-in browser, a printer); the name is
+the workflow's own. A route whose `to` is a list forks the item, one child per branch, each carrying the data so far.
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the

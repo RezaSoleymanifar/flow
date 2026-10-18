@@ -1,5 +1,5 @@
 """Behavior and edge-case tests, run against the realistic fake claude. python3 -m unittest discover -s tests"""
-import fcntl, json, os, re, sys, unittest
+import fcntl, json, os, re, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from base import Base, GOOD, PASS, SENT  # noqa: E402
@@ -478,6 +478,68 @@ class Validate(Base):
 
     def test_bad_start_is_caught(self):
         self.assertTrue(self.problems("start: x\nsteps:\n  a: {block: archive}\n"))
+
+
+class Parallel(Base):
+    """Items run PARALLEL at once; a block's lane runs one item at a time, oldest first; routes can fork."""
+    def slow_block(self, name, lane=None):
+        cfg = {"output": {"type": "object"}}
+        if lane: cfg["lane"] = lane
+        self.block(name, cfg)
+
+    def test_items_run_at_the_same_time_up_to_the_limit(self):
+        self.slow_block("slow"); self.workflow("p", "start: a\nsteps:\n  a: {block: slow}\n")
+        for k in "abcd": self.add(key=k, wf="p")
+        self.script(*([{"__sleep": 2}] * 4))
+        t0 = time.time(); self.run_flow("tick", env=dict(self.env, FLOW_PARALLEL="4")); dt = time.time() - t0
+        self.assertLess(dt, 6, "4 two-second items took %.1fs: not parallel" % dt)
+        self.assertEqual(set(self.statuses("p").values()), {"done"})
+
+    def test_a_lane_runs_one_at_a_time_oldest_first(self):
+        self.slow_block("click", lane="chrome"); self.workflow("p", "start: a\nsteps:\n  a: {block: click}\n")
+        for k in ("x1", "x2", "x3"): self.add(key=k, wf="p"); time.sleep(0.01)
+        self.script({"__sleep": 1}, {"__sleep": 1}, {"__sleep": 1})
+        t0 = time.time(); self.run_flow("tick", env=dict(self.env, FLOW_PARALLEL="4")); dt = time.time() - t0
+        self.assertGreater(dt, 2.5, "lane items overlapped")
+        self.assertEqual([e["item"] for e in self.events("work")], ["x1", "x2", "x3"])   # oldest first
+
+    def test_lane_items_do_not_block_other_lanes(self):
+        self.slow_block("click", lane="chrome"); self.slow_block("think")
+        self.workflow("p", "start: a\nsteps:\n  a: {block: click}\n")
+        self.workflow("q", "start: a\nsteps:\n  a: {block: think}\n")
+        self.add(key="c1", wf="p"); self.add(key="c2", wf="p"); self.add(key="t1", wf="q")
+        self.script({"__sleep": 1}, {"__sleep": 1}, {"__sleep": 1})
+        t0 = time.time(); self.run_flow("tick", env=dict(self.env, FLOW_PARALLEL="4")); dt = time.time() - t0
+        self.assertLess(dt, 3.5)                                          # t1 ran alongside c1, c2 queued once
+
+    def test_parallel_items_keep_separate_state_and_sessions(self):
+        self.slow_block("plain"); self.workflow("p", "start: a\nsteps:\n  a: {block: plain, routes: [{to: b}]}\n  b: {block: plain}\n")
+        for k in "abcd": self.add(key=k, wf="p")
+        self.script(*([{"__sleep": 1}] * 8))
+        self.run_flow("tick", env=dict(self.env, FLOW_PARALLEL="4"))
+        sess = [tuple(sorted(self.state(k)["sessions"].values())) for k in "abcd"]
+        self.assertEqual(len({x for s in sess for x in s}), 8)          # 4 items x 2 steps, all distinct sessions
+        self.assertEqual(set(self.statuses("p").values()), {"done"})
+
+    def test_fork_makes_one_child_per_branch_with_shared_data(self):
+        self.workflow("f", """
+            start: vet
+            steps:
+              vet:
+                block: archive
+                routes: [{to: [left, right]}]
+              left: {block: archive}
+              right: {block: archive}
+        """)
+        self.add(key="p", wf="f", inp={"name": "Sam"}); self.script({"v": 1}, {}, {}); self.tick()
+        self.assertEqual(self.statuses("f"), {"p": "done", "p.left": "done", "p.right": "done"})
+        kid = self.state("p.left")
+        self.assertEqual(kid["data"]["input"], {"name": "Sam"}); self.assertEqual(kid["data"]["vet"], {"v": 1})
+        self.assertEqual(kid["step"], "left"); self.assertEqual(len(self.events("fork")), 1)
+
+    def test_fork_to_unknown_step_is_caught_by_validate_and_at_runtime(self):
+        self.workflow("f", "start: a\nsteps:\n  a: {block: archive, routes: [{to: [b, nope]}]}\n  b: {block: archive}\n")
+        self.assertTrue(any("nope" in e for e in json.loads(self.run_flow("validate", "f").stdout)["f"]))
 
 
 class External(Base):

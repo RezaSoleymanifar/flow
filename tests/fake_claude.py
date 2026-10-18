@@ -16,7 +16,7 @@ Answers come from $FAKE_DIR/script.json, a list consumed in order. An entry is t
   {"__crash": "text", "code": 2}   no JSON at all: text on stderr, that exit code
   {"__sleep": 3}            sleep, then answer {}
 Every call is logged to $FAKE_DIR/calls.jsonl."""
-import json, os, re, sys, time, uuid
+import fcntl, json, os, re, sys, time, uuid
 
 D = os.environ["FAKE_DIR"]
 VALUE = {"-p", "--output-format", "--json-schema", "--permission-mode", "--tools", "--allowedTools", "--mcp-config",
@@ -59,9 +59,11 @@ if "--resume" in args and not os.path.exists(spath): fail("No conversation found
 if "--session-id" in args and os.path.exists(spath): fail("Error: Session ID %s is already in use." % sid)
 
 p = os.path.join(D, "script.json")
-script = json.load(open(p))
-ans = script.pop(0) if script else {"__error": "fake script ran out"}
-json.dump(script, open(p, "w"))
+with open(os.path.join(D, ".lock"), "w") as lk:          # fakes run in parallel: pop the next answer atomically
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    script = json.load(open(p))
+    ans = script.pop(0) if script else {"__error": "fake script ran out"}
+    json.dump(script, open(p, "w"))
 
 if "__crash" in ans: fail(ans["__crash"], ans.get("code", 1))
 if "__sleep" in ans: time.sleep(ans["__sleep"]); ans = {}

@@ -23,9 +23,12 @@ check and reviewer like any other answer.
 
 Env: FLOW_HOME (default: this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
 runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLOW_TIMEOUT (seconds per turn),
-FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs).
+FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items
+run at once, default 4; a block with `lane: <name>` runs one item at a time in that lane, oldest first).
+
+A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 """
-import ast, fcntl, json, os, shlex, subprocess, sys, time, uuid
+import ast, fcntl, json, os, shlex, subprocess, sys, threading, time, uuid
 
 import yaml
 import jsonschema
@@ -35,6 +38,7 @@ RUNS = os.environ.get("FLOW_RUNS") or os.path.join(HOME, "runs")
 CLAUDE = shlex.split(os.environ.get("FLOW_CLAUDE", "claude"))
 TIMEOUT = int(os.environ.get("FLOW_TIMEOUT", "1800"))
 RECORD = os.environ.get("FLOW_RECORD")
+PARALLEL = int(os.environ.get("FLOW_PARALLEL", "4"))   # items run at once; a block's `lane` is a one-at-a-time queue
 REVIEW_SCHEMA = {"type": "object", "required": ["pass", "notes"],
                  "properties": {"pass": {"type": "boolean"}, "notes": {"type": "string"}}}
 os.umask(0o027)   # state is readable by the sandbox group, writable only by the runner
@@ -334,6 +338,14 @@ def route(wf, st, out):
                 return finish(st, "done")
         except Exception as e:
             return stop(st, "route condition failed: %s" % e)
+        if isinstance(r.get("to"), list):   # fork: one child per branch, this item is done
+            kids = []
+            for branch in r["to"]:
+                if branch not in wf["steps"]: return stop(st, "routes to unknown step %r" % branch)
+                kid = new_item(st["workflow"], None, "%s.%s" % (st["id"], branch), branch, data=st["data"])
+                if kid: kids.append(kid["id"])
+            event(st, "fork", to=r["to"], items=kids)
+            return finish(st, "done")
         if r.get("to") == "end": return finish(st, "done")
         if r.get("to") not in wf["steps"]: return stop(st, "routes to unknown step %r" % r.get("to"))
         event(st, "route", to=r["to"])
@@ -347,14 +359,15 @@ def finish(st, status):
 # ---------- items ----------
 def safe_id(k): return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(k))[:80].lstrip(".") or "item"
 
-def new_item(wfname, inp, key=None, step=None):
+def new_item(wfname, inp, key=None, step=None, data=None):
     wf = workflow(wfname)
     iid = safe_id(key) if key else time.strftime("%Y%m%d%H%M%S-") + uuid.uuid4().hex[:6]
     d = item_dir(wfname, iid)
     if os.path.exists(os.path.join(d, "state.json")): return None   # dedupe: the same key never runs twice
     os.makedirs(d, exist_ok=True)
     st = {"id": iid, "workflow": wfname, "step": step or wf["start"], "status": "ready", "attempt": 0,
-          "steps_taken": 0, "feedback": None, "reason": None, "data": {"input": inp}, "sessions": {}, "created": now()}
+          "steps_taken": 0, "feedback": None, "reason": None, "data": json.loads(json.dumps(data)) if data else {"input": inp},
+          "sessions": {}, "created": now(), "seq": time.time()}
     save(st); event(st, "added"); return st
 
 def recover(wf, st):
@@ -380,14 +393,27 @@ def tick(wfname=None):
         if st["status"] == "running":
             try: recover(wf_of(st), st)
             except ConfigError as e: stop(st, str(e))
+    def lane_of(st):
+        try: return block(wf_of(st)["steps"][st["step"]]["block"]).get("lane")
+        except Exception: return None
+    def work(st):
+        try: run_step(wf_of(st), st)
+        except ConfigError as e: stop(st, "config: %s" % e)
+        except Exception as e: stop(st, "runner error: %s: %s" % (type(e).__name__, e))
     for _ in range(10000):   # keep going until nothing is ready: a chain runs end to end in one tick
-        ready = [s for s in all_items(wfname) if s["status"] == "ready"]
+        ready = sorted((s for s in all_items(wfname) if s["status"] == "ready"), key=lambda s: (s.get("seq", 0), s["id"]))
         if not ready: break
+        batch, lanes = [], set()   # one item per lane, up to PARALLEL items in all; oldest first
         for st in ready:
-            moved += 1
-            try: run_step(wf_of(st), st)
-            except ConfigError as e: stop(st, "config: %s" % e)
-            except Exception as e: stop(st, "runner error: %s: %s" % (type(e).__name__, e))
+            lane = lane_of(st)
+            if lane and lane in lanes: continue
+            if lane: lanes.add(lane)
+            batch.append(st)
+            if len(batch) >= PARALLEL: break
+        moved += len(batch)
+        threads = [threading.Thread(target=work, args=(st,)) for st in batch]
+        for t in threads: t.start()
+        for t in threads: t.join()
     res = {"steps_run": moved}
     if bad: res["unreadable"] = bad
     return res
@@ -405,7 +431,9 @@ def validate(name):
         routes = cfg.get("routes", [])
         if not isinstance(routes, list): errs.append("%s: routes must be a list" % s); continue
         for r in routes:
-            if r.get("to") != "end" and r.get("to") not in steps: errs.append("%s: routes to unknown step %r" % (s, r.get("to")))
+            targets = r.get("to") if isinstance(r.get("to"), list) else [r.get("to")]
+            for t in targets:
+                if t != "end" and t not in steps: errs.append("%s: routes to unknown step %r" % (s, t))
             for k in ("when", "each"):
                 if k in r:
                     try: parse_cond(r[k])
