@@ -13,7 +13,13 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow approve ITEM                    pass a gate
   flow reject ITEM NOTE                send a gated item back to its step with your note
   flow jump ITEM STEP [NOTE]           move an item to any step (resumes that step's session if it has one)
+  flow done ITEM JSON                  hand an external step its result (checked like a worker's answer)
+  flow fail ITEM REASON                report that an external step could not be done
   flow validate [WORKFLOW]             check workflow files and the blocks they use
+
+A block with `external: <who>` (e.g. chrome, human) is not run by a Claude session: the item waits in status
+"external" until `flow done` or `flow fail` brings the result. The result goes through the block's format,
+check and reviewer like any other answer.
 
 Env: FLOW_HOME (default: this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
 runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLOW_TIMEOUT (seconds per turn),
@@ -72,7 +78,7 @@ def block(name):
     p = os.path.join(d, b.get("prompt", "prompt.md"))
     if not os.path.exists(p): raise ConfigError("block %r has no prompt file" % name)
     with open(p) as f: b["prompt_text"] = f.read()
-    b.setdefault("output", {"type": "object"}); b.setdefault("tools", [])
+    b.setdefault("output", {"type": "object"}); b.setdefault("tools", []); b.setdefault("external", None)
     try: jsonschema.Draft202012Validator.check_schema(b["output"])
     except jsonschema.SchemaError as e: raise ConfigError("block %r output is not a valid schema: %s" % (name, e.message))
     return b
@@ -237,7 +243,7 @@ def worker_msg(b, st, resuming):
 def stop(st, reason):
     st.update(status="stuck", reason=reason); event(st, "stuck", reason=reason); save(st)
 
-def run_step(wf, st):
+def step_of(wf, st):
     step = wf["steps"].get(st["step"])
     if step is None: raise ConfigError("step %r is not in the workflow" % st["step"])
     b = block(step.get("block"))
@@ -245,16 +251,10 @@ def run_step(wf, st):
     os.makedirs(cwd, exist_ok=True)
     try: os.chmod(cwd, 0o2770)
     except OSError: pass
-    st["status"] = "running"; save(st)
-    sid = st["sessions"].get(st["step"])
-    resuming = sid is not None
-    run = lambda s, r: claude(worker_msg(b, st, r), b["output"], s, r, b["tools"], b.get("mcp"), b.get("model"), cwd)
-    out, reason, got, cost = run(sid or str(uuid.uuid4()), resuming)
-    if resuming and session_lost(reason):   # the session file is gone: start this step over in a fresh one
-        event(st, "session_lost", session=sid); del st["sessions"][st["step"]]; resuming = False
-        out, reason, got, cost = run(str(uuid.uuid4()), False)
-    if got: st["sessions"][st["step"]] = got   # a lost one is caught by session_lost on the next resume
-    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, reason=reason)
+    return step, b, cwd
+
+def judge(wf, st, step, b, cwd, out, reason):
+    """Shared tail of every step: check, review, then retry / stuck / gate / route."""
     if reason is None: reason = run_check(b, out, st, cwd)
     if reason is None: reason = review(b, out, st, cwd)
     if reason:
@@ -267,6 +267,29 @@ def run_step(wf, st):
     if step.get("gate"):
         st["status"] = "waiting"; event(st, "gate"); save(st); return
     route(wf, st, out)
+
+def run_step(wf, st):
+    step, b, cwd = step_of(wf, st)
+    if b["external"]:   # someone outside the engine does this step; flow done / flow fail bring the result
+        st["status"] = "external"; event(st, "external", who=b["external"], feedback=st.get("feedback")); save(st); return
+    st["status"] = "running"; save(st)
+    sid = st["sessions"].get(st["step"])
+    resuming = sid is not None
+    run = lambda s, r: claude(worker_msg(b, st, r), b["output"], s, r, b["tools"], b.get("mcp"), b.get("model"), cwd)
+    out, reason, got, cost = run(sid or str(uuid.uuid4()), resuming)
+    if resuming and session_lost(reason):   # the session file is gone: start this step over in a fresh one
+        event(st, "session_lost", session=sid); del st["sessions"][st["step"]]; resuming = False
+        out, reason, got, cost = run(str(uuid.uuid4()), False)
+    if got: st["sessions"][st["step"]] = got   # a lost one is caught by session_lost on the next resume
+    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, reason=reason)
+    judge(wf, st, step, b, cwd, out, reason)
+
+def external_result(wf, st, out):
+    step, b, cwd = step_of(wf, st)
+    try: jsonschema.validate(out, b["output"]); reason = None
+    except jsonschema.ValidationError as e: reason = "the result broke the required format: %s" % e.message
+    event(st, "done", who=b["external"], ok=reason is None, reason=reason)
+    judge(wf, st, step, b, cwd, out, reason)
 
 def route(wf, st, out):
     st["steps_taken"] = st.get("steps_taken", 0) + 1
@@ -410,6 +433,19 @@ def main(a):
                 note = " ".join(rest[2:]) or None
                 event(st, "jump", to=rest[1]); st.update(step=rest[1], status="ready", attempt=0, reason=None, feedback=note); save(st)
             print(json.dumps({k: st.get(k) for k in ("id", "step", "status")})); return 0
+        if cmd in ("done", "fail"):
+            if len(rest) < 2: die("usage: flow %s ITEM %s" % (cmd, "JSON" if cmd == "done" else "REASON"))
+            st = load(rest[0]); wf = workflow(st["workflow"])
+            if st["status"] != "external": die("%s is %s, not waiting on an external step" % (st["id"], st["status"]))
+            if cmd == "done":
+                try: out = json.loads(rest[1])
+                except ValueError: die("result is not valid JSON")
+                external_result(wf, st, out)
+            else:
+                step, b, cwd = step_of(wf, st)
+                event(st, "failed", who=b["external"], reason=" ".join(rest[1:]))
+                judge(wf, st, step, b, cwd, None, " ".join(rest[1:]))
+            print(json.dumps({k: st.get(k) for k in ("id", "step", "status", "reason")})); return 0
         if cmd == "validate":
             wd = os.path.join(HOME, "workflows")
             names = rest or ([f[:-5] for f in sorted(os.listdir(wd)) if f.endswith(".yaml")] if os.path.isdir(wd) else [])

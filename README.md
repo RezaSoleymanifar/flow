@@ -24,6 +24,11 @@ steps:
   archive: {block: archive, routes: [{to: end}]}
 ```
 
+An **external** block (`external: chrome`, `external: human`) is done by someone outside the engine: the item waits
+in status `external` until `flow done ITEM JSON` or `flow fail ITEM REASON` brings the result, which then goes
+through the same format check, check script and reviewer as a worker's answer. This is how a step that needs a
+logged-in browser or a person plugs into an otherwise headless workflow.
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the
@@ -48,6 +53,7 @@ flow add WORKFLOW '{"name": "Sam"}' --key sam
 flow tick                   # run ready items (cron does this)
 flow status | flow show ITEM
 flow approve ITEM | flow reject ITEM NOTE | flow jump ITEM STEP [NOTE]
+flow done ITEM '{"sent": true}' | flow fail ITEM REASON     # results of external steps
 ```
 
 Every command prints JSON, so an agent can operate it.

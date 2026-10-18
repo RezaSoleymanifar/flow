@@ -443,5 +443,76 @@ class Validate(Base):
         self.assertTrue(self.problems("start: x\nsteps:\n  a: {block: archive}\n"))
 
 
+class External(Base):
+    """A block with `external: chrome` is done by someone outside the engine; the result comes back via `flow done`."""
+    def setUp(self):
+        super().setUp()
+        self.block("connect", {"output": {"type": "object", "required": ["sent"],
+                                          "properties": {"sent": {"type": "boolean"}, "note": {"type": "string"}}},
+                               "external": "chrome", "once": True, "check": "check.py"},
+                   check="import json,sys\nd=json.load(sys.stdin)\n"
+                         "if not d['out']['sent']: print('nothing was sent'); sys.exit(1)\n")
+        self.workflow("connect", """
+            start: vet
+            steps:
+              vet:
+                block: archive
+                routes: [{to: connect}]
+              connect:
+                block: connect
+                routes: [{to: end}]
+        """)
+
+    def test_external_step_waits_and_tick_leaves_it_alone(self):
+        self.add(key="r1", wf="connect"); self.script({}); self.tick()
+        st = self.state("r1"); self.assertEqual((st["status"], st["step"]), ("external", "connect"))
+        self.tick(); self.assertEqual(len(self.calls()), 1)             # no Claude call for an external step
+        self.assertEqual(self.events("external")[-1]["who"], "chrome")
+
+    def test_done_validates_checks_and_routes(self):
+        self.add(key="r1", wf="connect"); self.script({}); self.tick()
+        p = self.run_flow("done", "r1", '{"nope": 1}')                  # wrong format: once step -> stuck
+        self.assertEqual(json.loads(p.stdout)["status"], "stuck")
+        self.flow("jump", "r1", "connect"); self.tick()
+        self.flow("done", "r1", '{"sent": true, "note": "ok"}')
+        st = self.state("r1"); self.assertEqual(st["status"], "done"); self.assertEqual(st["data"]["connect"]["sent"], True)
+
+    def test_done_that_fails_the_check_on_a_once_step_is_stuck(self):
+        self.add(key="r1", wf="connect"); self.script({}); self.tick()
+        self.flow("done", "r1", '{"sent": false}')
+        st = self.state("r1"); self.assertEqual(st["status"], "stuck"); self.assertIn("nothing was sent", st["reason"])
+
+    def test_fail_reports_and_a_retryable_external_step_goes_back_to_ready(self):
+        self.block("ask", {"output": {"type": "object"}, "external": "human"})
+        self.workflow("ask", "start: a\nsteps:\n  a: {block: ask}\n")
+        self.add(key="q", wf="ask"); self.tick()
+        self.flow("fail", "q", "could", "not", "reach", "the", "site")
+        st = self.state("q"); self.assertEqual((st["status"], st["attempt"]), ("ready", 1))
+        self.tick(); self.assertEqual(self.state("q")["status"], "external")
+        self.assertIn("could not reach the site", self.events("external")[-1]["feedback"])
+
+    def test_done_needs_an_external_item_and_valid_json(self):
+        self.add(key="r1", wf="connect")
+        p = self.run_flow("done", "r1", "{}"); self.assertEqual(p.returncode, 2); self.assertIn("not waiting", p.stdout)
+        self.script({}); self.tick()
+        p = self.run_flow("done", "r1", "{bad"); self.assertEqual(p.returncode, 2); self.assertIn("not valid JSON", p.stdout)
+
+    def test_external_step_can_be_gated_and_reviewed(self):
+        self.block("draft-ext", {"output": {"type": "object"}, "external": "human", "review": "Must contain hello."})
+        self.workflow("g", """
+            start: a
+            steps:
+              a:
+                block: draft-ext
+                gate: true
+                routes: [{to: end}]
+        """)
+        self.add(key="x", wf="g"); self.tick(); self.script({"pass": True, "notes": ""})
+        self.flow("done", "x", '{"text": "hello"}')
+        self.assertEqual(self.state("x")["status"], "waiting")
+        self.assertEqual(self.calls()[0]["tools"], "")                   # the reviewer ran, no tools
+        self.flow("approve", "x"); self.assertEqual(self.state("x")["status"], "done")
+
+
 if __name__ == "__main__":
     unittest.main()
