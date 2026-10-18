@@ -596,6 +596,37 @@ class External(Base):
         self.script({}); self.tick()
         p = self.run_flow("done", "r1", "{bad"); self.assertEqual(p.returncode, 2); self.assertIn("not valid JSON", p.stdout)
 
+    def test_batch_external_step_records_the_whole_list_then_fans_out(self):
+        """Batching is the opposite of parallelism: one step handles many things in one go (one search, one
+        inbox read) and answers with a list. The record script sees the whole list once; `each:` then makes one
+        item per element for the steps that follow."""
+        d = os.path.join(self.home, "blocks", "search"); os.makedirs(d)
+        with open(os.path.join(d, "block.yaml"), "w") as f:
+            json.dump({"output": {"type": "object", "required": ["found"], "properties": {"found": {"type": "array"}}},
+                       "external": "chrome", "record": "record.py"}, f)
+        with open(os.path.join(d, "prompt.md"), "w") as f: f.write("Search once, report everyone found.")
+        with open(os.path.join(d, "record.py"), "w") as f:
+            f.write("import json,sys,os\nd=json.load(sys.stdin)\n"
+                    "open(os.path.join(os.environ['FAKE_DIR'],'recorded.json'),'w').write(json.dumps(d['out']['found']))\n")
+        self.workflow("batch", """
+            start: search
+            steps:
+              search:
+                block: search
+                routes: [{each: out.found, to: handle}]
+              handle:
+                block: archive
+                routes: [{to: end}]
+        """)
+        self.add({"query": "ai recruiters"}, key="s1", wf="batch"); self.tick()
+        self.assertEqual(self.state("s1")["status"], "external")
+        found = [{"key": "ann", "name": "Ann"}, {"key": "bob", "name": "Bob"}]
+        self.flow("done", "s1", json.dumps({"found": found}))
+        with open(os.path.join(self.fake, "recorded.json")) as f: self.assertEqual(json.load(f), found)   # one record, whole list
+        self.script({}, {}); self.tick()
+        self.assertEqual(self.statuses("batch"), {"s1": "done", "ann": "done", "bob": "done"})
+        self.assertEqual(self.state("bob")["data"]["input"], {"key": "bob", "name": "Bob"})
+
     def test_external_step_can_be_gated_and_reviewed(self):
         self.block("draft-ext", {"output": {"type": "object"}, "external": "human", "review": "Must contain hello."})
         self.workflow("g", """

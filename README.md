@@ -41,6 +41,10 @@ once, oldest first; each still gets its own session, checks, reviewer and record
 one item at a time in that lane, for a resource that cannot be shared (a logged-in browser, a printer); the name is
 the workflow's own. A route whose `to` is a list forks the item, one child per branch, each carrying the data so far.
 
+**Batching** is the opposite: one step handles many things in one go (one search that finds twenty people, one
+inbox read that answers ten mails) and answers with a list. The record script sees the whole list once; an `each:`
+route then makes one item per element for the steps that follow, where parallelism and lanes take over.
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the
