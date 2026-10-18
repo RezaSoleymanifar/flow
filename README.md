@@ -32,6 +32,10 @@ logged-in browser or a person plugs into an otherwise headless workflow.
 A check script exits 0 to pass, 1 to fail with a reason the worker can fix (printed on stdout), or 2 to fail for a
 reason no retry can change, such as a do-not-contact rule: the item stops at once.
 
+A **record** script (`record: record.py` in block.yaml) runs after a step passes and before it routes on. It gets
+the answer and the item's data on stdin and writes whatever the workflow must never forget (a message sent, a
+verdict) to the workflow's own store, such as a database. If it fails, the item stops: nothing moves on unrecorded.
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the

@@ -230,6 +230,36 @@ class Failures(Base):
         self.assertIn("no block", self.state("x")["reason"]); self.assertEqual(self.state("y")["status"], "done")
 
 
+class Records(Base):
+    def test_record_runs_after_pass_with_the_answer_and_item(self):
+        self.block("draft", {"output": {"type": "object"}, "record": "record.py"},
+                   check=None)
+        with open(os.path.join(self.home, "blocks", "draft", "record.py"), "w") as f:
+            f.write("import json,sys,os\nd=json.load(sys.stdin)\n"
+                    "open(os.environ['REC'],'a').write(json.dumps([d['item'],d['step'],d['out']])+'\\n')\n")
+        self.workflow("reply", "start: draft\nsteps:\n  draft: {block: draft, routes: [{to: end}]}\n")
+        self.env["REC"] = os.path.join(self.fake, "rec.jsonl")
+        self.add(); self.script({"x": 1}); self.tick()
+        with open(self.env["REC"]) as f: rows = [json.loads(l) for l in f]
+        self.assertEqual(rows, [["i1", "draft", {"x": 1}]]); self.assertEqual(self.state("i1")["status"], "done")
+
+    def test_record_failure_stops_the_item_before_routing(self):
+        self.block("draft", {"output": {"type": "object"}, "record": "record.py"})
+        with open(os.path.join(self.home, "blocks", "draft", "record.py"), "w") as f: f.write("print('db locked'); raise SystemExit(1)\n")
+        self.workflow("reply", "start: draft\nsteps:\n  draft: {block: draft, routes: [{to: send}]}\n  send: {block: send}\n")
+        self.add(); self.script({}, {"sent": True}); self.tick()
+        st = self.state("i1"); self.assertEqual((st["status"], st["step"]), ("stuck", "draft")); self.assertIn("db locked", st["reason"])
+        self.assertEqual(len(self.calls()), 1)                          # send never ran
+
+    def test_record_does_not_run_on_a_failed_answer(self):
+        self.block("draft", {"output": {"type": "object", "required": ["k"]}, "record": "record.py"})
+        with open(os.path.join(self.home, "blocks", "draft", "record.py"), "w") as f: f.write("raise SystemExit('should not run')\n")
+        self.workflow("reply", "start: draft\nsteps:\n  draft: {block: draft}\n")
+        self.add(); self.script({}, {"k": 1}); self.tick()
+        self.assertEqual(self.state("i1")["status"], "stuck")           # record ran on the good answer and failed, as designed
+        self.assertEqual(len(self.events("record")), 1)
+
+
 class OnceSteps(Base):
     def test_a_once_step_that_fails_is_never_retried_on_its_own(self):
         self.add(); self.script(GOOD, PASS, {"sent": "maybe"}, SENT); self.tick()

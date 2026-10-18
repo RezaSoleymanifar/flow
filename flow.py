@@ -224,6 +224,20 @@ def run_check(b, out, st, cwd):
     reason = "check failed: " + (p.stdout.strip() or p.stderr.strip()[-400:] or "no reason given")
     return FinalFail(reason) if p.returncode == 2 else reason   # exit 2: nothing a retry could fix
 
+def run_record(b, out, st, cwd):
+    """A block's record script runs after a step passes, before routing. It is how a workflow writes facts
+    (a sent message, a decision) to its own store without relying on an agent to remember. A failure stops the item."""
+    if not b.get("record"): return None
+    path = os.path.join(b["dir"], b["record"])
+    if not os.path.exists(path): raise ConfigError("record script %s is missing" % b["record"])
+    argv = [sys.executable, path] if path.endswith(".py") else [path]
+    try:
+        p = subprocess.run(argv, input=json.dumps({"out": out, "data": st["data"], "item": st["id"],
+                           "workflow": st["workflow"], "step": st["step"]}), capture_output=True, text=True, cwd=cwd, timeout=300)
+    except (subprocess.TimeoutExpired, OSError) as e: return "record failed: %s" % e
+    event(st, "record", ok=p.returncode == 0, output=p.stdout.strip()[-400:])
+    return None if p.returncode == 0 else "record failed: " + (p.stdout.strip() or p.stderr.strip()[-400:] or "no reason given")
+
 def review(b, out, st, cwd):
     if not b.get("review"): return None
     msg = ("You are reviewing another agent's work. You did not do it. Judge it only against the rubric.\n\n"
@@ -271,6 +285,8 @@ def judge(wf, st, step, b, cwd, out, reason):
         if st["attempt"] >= wf["max_attempts"]: return stop(st, reason)
         st["status"] = "ready"; event(st, "retry", reason=reason); save(st); return
     st["data"][st["step"]] = out; st["feedback"] = None; st["reason"] = None
+    rec = run_record(b, out, st, cwd)
+    if rec: save(st); return stop(st, rec)   # the fact was not written down: never route on as if it were
     if step.get("gate"):
         st["status"] = "waiting"; event(st, "gate"); save(st); return
     route(wf, st, out)
