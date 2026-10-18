@@ -43,7 +43,9 @@ the workflow's own. A route whose `to` is a list forks the item, one child per b
 
 **Batching** is the opposite: one step handles many things in one go (one search that finds twenty people, one
 inbox read that answers ten mails) and answers with a list. The record script sees the whole list once; an `each:`
-route then makes one item per element for the steps that follow, where parallelism and lanes take over.
+route then makes one item per element for the steps that follow, where parallelism and lanes take over. Each child
+gets its element as `data.input` and the batch's own input as `data.batch`, so a preset set on the batch is visible
+downstream (`when: data.batch.channel == "email"`).
 
 ## How a step runs
 

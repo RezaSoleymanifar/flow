@@ -324,6 +324,7 @@ class FanOut(Base):
         self.add(key="night1", wf="follow"); self.script(found, {}, {}); self.tick()
         self.assertEqual(self.statuses("follow"), {"night1": "done", "t1": "done", "t2": "done"})
         self.assertEqual(self.state("t1")["data"]["input"], {"key": "t1", "from": "A"})
+        self.assertEqual(self.state("t1")["data"]["batch"], {"name": "Sam"})        # the batch's input rides along
         n = len(self.calls())
         self.add(key="night2", wf="follow"); self.script(found); self.tick()
         self.assertEqual(sorted(self.statuses("follow")), ["night1", "night2", "t1", "t2"])

@@ -28,6 +28,7 @@ FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from re
 run at once, default 4; a block with `lane: <name>` runs one item at a time in that lane, oldest first).
 
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
+`each:` children get the element as data.input and the batch's input as data.batch.
 """
 import ast, fcntl, json, os, shlex, subprocess, sys, threading, time, uuid
 
@@ -345,7 +346,8 @@ def route(wf, st, out):
                 for i, el in enumerate(elems):
                     el = json.loads(json.dumps(el))
                     key = str(el.get("key")) if isinstance(el, dict) and el.get("key") not in (None, "") else "%s-%d" % (st["id"], i)
-                    if new_item(st["workflow"], el, key, r["to"]): spawned.append(safe_id(key))
+                    child = {"input": el, "batch": st["data"].get("input")}   # the batch's own input (flavor etc.) rides along
+                    if new_item(st["workflow"], el, key, r["to"], data=child): spawned.append(safe_id(key))
                 event(st, "fan_out", to=r["to"], items=spawned)
                 return finish(st, "done")
         except Exception as e:
