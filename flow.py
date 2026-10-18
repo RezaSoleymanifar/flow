@@ -219,10 +219,10 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        LAST_SECONDS = round(time.time() - t0, 1); return None, "the session timed out after %ss" % TIMEOUT, None, None
+        LAST_SECONDS = round(time.time() - t0, 2); return None, "the session timed out after %ss" % TIMEOUT, None, None
     except OSError as e:
-        LAST_SECONDS = round(time.time() - t0, 1); return None, "could not start claude: %s" % e, None, None
-    LAST_SECONDS = round(time.time() - t0, 1)   # wall time of this call, logged on the work/review event
+        LAST_SECONDS = round(time.time() - t0, 2); return None, "could not start claude: %s" % e, None, None
+    LAST_SECONDS = round(time.time() - t0, 2)   # wall time of this call, logged on the work/review event
     record(cmd, p)
     return parse_reply(p.stdout, p.returncode, p.stderr, schema)
 
