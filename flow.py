@@ -11,7 +11,7 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow tick [WORKFLOW]                 run every ready item until it ends, waits at a gate or gets stuck
   flow report [WORKFLOW] [--since DATE]   items, Claude calls, cost, retries, wait per step, from the events log
   flow status [WORKFLOW]               one JSON line per item
-  flow show ITEM                       one item's whole state
+  flow show ITEM                       one item's whole state (ITEM may be WORKFLOW/ID when ids collide)
   flow approve ITEM                    pass a gate
   flow reject ITEM NOTE                send a gated item back to its step with your note
   flow jump ITEM STEP [NOTE]           move an item to any step (resumes that step's session if it has one)
@@ -126,9 +126,14 @@ def all_items(wfname=None, bad=None):
     return out
 
 def load(iid):
-    for st in all_items():
-        if st["id"] == iid: return st
-    die("no item %s" % iid)
+    """An item by id, or by WORKFLOW/ID when the same id exists in more than one workflow."""
+    wf = None
+    if "/" in iid: wf, iid = iid.split("/", 1)
+    hits = [st for st in all_items(wf) if st["id"] == iid]
+    if not hits: die("no item %s" % (wf + "/" + iid if wf else iid))
+    if len(hits) > 1: die("item %s exists in %s; say which: %s" % (iid, ", ".join(h["workflow"] for h in hits),
+                                                                  " or ".join("%s/%s" % (h["workflow"], iid) for h in hits)))
+    return hits[0]
 
 def save(st): write_json(os.path.join(item_dir(st["workflow"], st["id"]), "state.json"), st)
 

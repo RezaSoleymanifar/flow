@@ -473,6 +473,14 @@ class Cli(Base):
         st = json.loads(self.flow("show", "h1"))
         self.assertEqual((st["step"], st["status"]), ("ship", "external"))   # triage ran, check+record stubs passed, waits on chrome
 
+    def test_same_id_in_two_workflows_needs_the_workflow_prefix(self):
+        self.workflow("other", "start: a\nsteps:\n  a: {block: archive}\n")
+        self.add(key="x"); self.add(key="x", wf="other")
+        p = self.run_flow("show", "x"); self.assertEqual(p.returncode, 2); self.assertIn("exists in", p.stdout)
+        self.assertEqual(json.loads(self.flow("show", "other/x"))["workflow"], "other")
+        self.assertEqual(json.loads(self.flow("show", "reply/x"))["workflow"], "reply")
+        p = self.run_flow("show", "other/nope"); self.assertEqual(p.returncode, 2)
+
     def test_items_without_a_key_get_unique_ids(self):
         ids = {json.loads(self.flow("add", "reply", "{}"))["added"] for _ in range(5)}
         self.assertEqual(len(ids), 5)
