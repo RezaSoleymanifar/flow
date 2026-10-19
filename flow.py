@@ -21,6 +21,8 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow new block NAME [--external WHO] [--check] [--record]   scaffold blocks/NAME (block.yaml, prompt.md, stubs)
   flow new workflow NAME BLOCK [BLOCK...]                      scaffold workflows/NAME.yaml as a straight chain
 
+A block with no tools (a pure judge) runs with a bare system prompt, no settings or project memory, in a scratch
+folder: nothing but prompt.md and the item reaches the model.
 A block with `driver: <script>` is done by that script for zero tokens: item data in on stdin, the answer out as
 JSON, then the same checks and record as any answer. Exit 3 = "I can't handle this one": the item falls back to
 the block's `external` owner. One script per block; the block boundary is the script boundary.
@@ -36,7 +38,7 @@ run at once, default 4; a block with `lane: <name>` runs one item at a time in t
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 `each:` children get the element as data.input and the batch's input as data.batch.
 """
-import ast, fcntl, json, os, re, shlex, subprocess, sys, threading, time, uuid
+import ast, fcntl, json, os, re, shlex, subprocess, sys, tempfile, threading, time, uuid
 
 import yaml
 import jsonschema
@@ -225,6 +227,7 @@ def parse_reply(stdout, returncode, stderr, schema):
     except jsonschema.ValidationError as e: return None, "the answer broke the required format: %s" % e.message, sid, cost
     return out, None, sid, cost
 
+BARE_SYSTEM = "You are a careful judge. Read the instructions and the item, then answer only with JSON that matches the required format."
 LAST_SECONDS = 0.0
 LAST_TOKENS = {}                      # the last call's usage: in (fresh input), cached (read from cache), out
 
@@ -243,6 +246,8 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     if allowed: cmd += ["--allowedTools", ",".join(allowed)]
     if mcp: cmd += ["--mcp-config", json.dumps({"mcpServers": mcp})]
     if model: cmd += ["--model", model]
+    if not tools and not mcp:        # a pure judge: no settings, hooks, project memory or tool preamble, and a bare
+        cmd += ["--setting-sources", "", "--system-prompt", BARE_SYSTEM]; cwd = tempfile.gettempdir()   # system prompt
     cmd += ["--resume", session] if resume else ["--session-id", session]
     global LAST_SECONDS, LAST_TOKENS; t0 = time.time(); LAST_TOKENS = {}
     try:

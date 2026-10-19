@@ -120,7 +120,9 @@ class Sessions(Base):
         self.add(key="a"); self.add(key="b"); self.script(GOOD, PASS, SENT, GOOD, PASS, SENT); self.tick()
         a, b = self.state("a"), self.state("b")
         self.assertFalse(set(a["sessions"].values()) & set(b["sessions"].values()))
-        self.assertEqual(len({c["cwd"] for c in self.calls()}), 2)
+        work = [c for c in self.calls() if c["tools"]]          # tool-less calls (the reviewer) run in a scratch dir
+        self.assertEqual(len({c["cwd"] for c in work}), 2)
+        self.assertTrue(all(c["system"] for c in self.calls() if not c["tools"]))
 
     def test_retry_resumes_the_same_conversation(self):
         self.add(); self.script({"intent": "reply"}, GOOD, PASS, SENT); self.tick()
