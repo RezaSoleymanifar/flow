@@ -20,7 +20,7 @@ import fcntl, json, os, re, sys, time, uuid
 
 D = os.environ["FAKE_DIR"]
 VALUE = {"-p", "--output-format", "--json-schema", "--permission-mode", "--tools", "--allowedTools", "--mcp-config",
-         "--model", "--resume", "--session-id"}
+         "--model", "--resume", "--session-id", "--setting-sources", "--system-prompt"}
 BOOL = {"--strict-mcp-config"}
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -51,7 +51,7 @@ with open(os.path.join(D, "calls.jsonl"), "a") as log:
     log.write(json.dumps({"msg": args.get("-p"), "resume": args.get("--resume"), "session_id": args.get("--session-id"),
                           "tools": args.get("--tools"), "allowed": args.get("--allowedTools"), "model": args.get("--model"),
                           "mcp": args.get("--mcp-config"), "permission": args.get("--permission-mode"),
-                          "schema": json.loads(args.get("--json-schema") or "null"), "cwd": os.getcwd(),
+                          "schema": json.loads(args.get("--json-schema") or "null"), "cwd": os.getcwd(), "system": args.get("--system-prompt"),
                           "history": len(history) if os.path.exists(spath) else None}) + "\n")
 
 

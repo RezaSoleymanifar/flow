@@ -26,6 +26,8 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
 
 A block with `review_view: <script>` decides what its reviewer sees ({"out","data"} in, {"item","answer"} out) and
 can skip the review when nothing in the answer needs one (empty output): review only the risky part of a batch.
+A block with no tools (a pure judge) runs with a bare system prompt, no settings or project memory, in a scratch
+folder: nothing but prompt.md and the item reaches the model.
 A block with `driver: <script>` is done by that script for zero tokens: item data in on stdin, the answer out as
 JSON, then the same checks and record as any answer. Exit 3 = "I can't handle this one": the item falls back to
 the block's `external` owner. One script per block; the block boundary is the script boundary.
@@ -47,7 +49,7 @@ arrival and can be approved any time, with whatever has arrived; without a gate 
 still arrive. Nobody is too late: a child arriving after its merge was approved or moved on opens the next round
 (ID.STEP-2, -3, ...), so you can stop whenever and continue from what is already done.
 """
-import ast, fcntl, json, os, re, shlex, subprocess, sys, threading, time, uuid
+import ast, fcntl, json, os, re, shlex, subprocess, sys, tempfile, threading, time, uuid
 
 import yaml
 import jsonschema
@@ -236,6 +238,7 @@ def parse_reply(stdout, returncode, stderr, schema):
     except jsonschema.ValidationError as e: return None, "the answer broke the required format: %s" % e.message, sid, cost
     return out, None, sid, cost
 
+BARE_SYSTEM = "You are a careful judge. Read the instructions and the item, then answer only with JSON that matches the required format."
 LAST_SECONDS = 0.0
 LAST_TOKENS = {}                      # the last call's usage: in (fresh input), cached (read from cache), out
 
@@ -254,6 +257,8 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     if allowed: cmd += ["--allowedTools", ",".join(allowed)]
     if mcp: cmd += ["--mcp-config", json.dumps({"mcpServers": mcp})]
     if model: cmd += ["--model", model]
+    if not tools and not mcp:        # a pure judge: no settings, hooks, project memory or tool preamble, and a bare
+        cmd += ["--setting-sources", "", "--system-prompt", BARE_SYSTEM]; cwd = tempfile.gettempdir()   # system prompt
     cmd += ["--resume", session] if resume else ["--session-id", session]
     global LAST_SECONDS, LAST_TOKENS; t0 = time.time(); LAST_TOKENS = {}
     try:
