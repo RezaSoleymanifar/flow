@@ -2,7 +2,7 @@
 import fcntl, json, os, re, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from base import Base, GOOD, PASS, SENT  # noqa: E402
+from base import Base, GOOD, PASS, SENT, REPLY  # noqa: E402
 
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
@@ -882,3 +882,37 @@ class Join(Base):
         self.workflow("fan", self.FAN.replace("HANDLE_GATE", "").replace("join: true", "join: true\n            block: archive")
                                      .replace("MERGE_GATE", ""))
         self.assertIn("runs no block", json.loads(self.run_flow("validate", "fan").stdout)["fan"][0])
+
+
+class Schedule(Base):
+    """A workflow declares `schedule:`; `flow schedule` owns one crontab block per FLOW_HOME; cron calls `flow run`."""
+    def setUp(self):
+        super().setUp()
+        fake = os.path.join(self.fake, "crontab.py")
+        with open(fake, "w") as f:
+            f.write("import sys,os\np=os.path.join(os.environ['FAKE_DIR'],'crontab.txt')\n"
+                    "if sys.argv[1]=='-l':\n    sys.exit(1) if not os.path.exists(p) else sys.stdout.write(open(p).read())\n"
+                    "else: open(p,'w').write(sys.stdin.read())\n")
+        self.env["FLOW_CRONTAB"] = "%s %s" % (sys.executable, fake)
+        with open(os.path.join(self.fake, "crontab.txt"), "w") as f: f.write("PATH=/usr/bin\n15 4 * * * other-job\n")
+
+    def cron(self):
+        with open(os.path.join(self.fake, "crontab.txt")) as f: return f.read()
+
+    def test_schedule_writes_one_line_per_scheduled_workflow_and_keeps_other_lines(self):
+        self.workflow("reply", REPLY + "schedule: \"52 6 * * *\"\n")
+        self.flow("schedule"); c = self.cron()
+        self.assertIn("15 4 * * * other-job", c)
+        line = [l for l in c.splitlines() if l.startswith("52 6 * * *")][0]
+        self.assertIn("run reply", line); self.assertIn("FLOW_HOME=", line)
+        self.flow("schedule"); self.assertEqual(self.cron(), c)                       # idempotent
+        self.workflow("reply", REPLY); self.flow("schedule")                          # schedule removed: block gone
+        self.assertNotIn("run reply", self.cron()); self.assertIn("other-job", self.cron())
+
+    def test_run_adds_a_minute_keyed_item_and_ticks_it(self):
+        self.script(GOOD, PASS, SENT); out = json.loads(self.flow("run", "reply", json.dumps({"name": "Sam"})))
+        self.assertTrue(out["added"].startswith("reply-")); self.assertEqual(self.state(out["added"])["status"], "done")
+
+    def test_validate_refuses_a_bad_schedule(self):
+        self.workflow("reply", REPLY + "schedule: \"every morning\"\n")
+        self.assertIn("5-field cron", json.loads(self.run_flow("validate", "reply").stdout)["reply"][0])

@@ -9,6 +9,9 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow add WORKFLOW [JSON|@FLAVOR] [--key K] [--step S]   new item (at the start step, or S); JSON, or a preset from
                                        FLOW_HOME/flavors.yaml ({workflow: {flavor: input}}), becomes data.input; --key dedupes
   flow tick [WORKFLOW]                 run every ready item until it ends, waits at a gate or gets stuck
+  flow run WORKFLOW [JSON]             add a run keyed by the minute, then tick that workflow (what a schedule calls)
+  flow schedule                        write each workflow's `schedule:` (5-field cron) into the crontab, one line per
+                                       workflow, in a block owned by this FLOW_HOME; other lines and homes are untouched
   flow report [WORKFLOW] [--since DATE]   items, Claude calls, cost, retries, wait per step, from the events log
   flow status [WORKFLOW]               one JSON line per item
   flow show ITEM                       one item's whole state (ITEM may be WORKFLOW/ID when ids collide)
@@ -591,11 +594,44 @@ def tick(wfname=None):
     return res
 
 
+# ---------- schedule ----------
+CRONTAB = shlex.split(os.environ.get("FLOW_CRONTAB") or "crontab")   # tests point this at a fake
+
+def schedule_lines():
+    """One crontab line per workflow that declares `schedule:`, carrying this home's FLOW_* settings."""
+    out, wd = [], os.path.join(HOME, "workflows")
+    env = [("FLOW_HOME", HOME)] + [(k, os.environ[k]) for k in ("FLOW_RUNS", "FLOW_CLAUDE", "FLOW_PARALLEL", "FLOW_TIMEOUT") if os.environ.get(k)]
+    env = " ".join("%s=%s" % (k, shlex.quote(v)) for k, v in env)
+    for f in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
+        if not f.endswith(".yaml"): continue
+        sch = workflow(f[:-5]).get("schedule")
+        if sch: out.append("%s %s %s %s run %s >> %s 2>&1" % (sch, env, shlex.quote(sys.executable), shlex.quote(os.path.realpath(__file__)),
+                                                             f[:-5], shlex.quote(os.path.join(RUNS, "cron.log"))))
+    return out
+
+def schedule_sync():
+    begin, end = "# flow: begin " + HOME, "# flow: end " + HOME
+    p = subprocess.run(CRONTAB + ["-l"], capture_output=True, text=True)
+    keep, inside = [], False
+    for l in (p.stdout if p.returncode == 0 else "").splitlines():
+        if l == begin: inside = True; continue
+        if l == end: inside = False; continue
+        if not inside: keep.append(l)
+    mine = schedule_lines()
+    if mine: keep += [begin, "# managed by `flow schedule`: edit schedule: in %s/workflows, then rerun it" % HOME] + mine + [end]
+    q = subprocess.run(CRONTAB + ["-"], input="\n".join(keep).strip("\n") + "\n", capture_output=True, text=True)
+    if q.returncode: die("crontab refused the update: " + (q.stderr.strip() or "no reason given"))
+    return mine
+
+
 # ---------- validate ----------
 def validate(name):
     try: wf = workflow(name)
     except Exception as e: return ["%s: %s" % (name, e)]
     errs, steps = [], wf["steps"]
+    sch = wf.get("schedule")
+    if sch is not None and (not isinstance(sch, str) or len(sch.split()) != 5 or "%" in sch):
+        errs.append("schedule must be a 5-field cron expression like \"52 6 * * *\", got %r" % (sch,))
     for s, cfg in steps.items():
         cfg = cfg or {}
         if cfg.get("join"):
@@ -739,6 +775,14 @@ def main(a):
             key = opts.get("--key"); st = new_item(rest[0], inp, key, opts.get("--step"))
             print(json.dumps({"added": st["id"]} if st else {"exists": safe_id(key)})); return 0
         if cmd == "tick": print(json.dumps(tick(rest[0] if rest else None))); return 0
+        if cmd == "run":
+            if not rest: die("usage: flow run WORKFLOW [JSON]")
+            try: inp = json.loads(rest[1]) if len(rest) > 1 else {}
+            except ValueError: die("input is not valid JSON")
+            st = new_item(rest[0], inp, "%s-%s" % (rest[0], time.strftime("%Y%m%d-%H%M")))
+            print(json.dumps({"added": st["id"] if st else None, "tick": tick(rest[0])})); return 0
+        if cmd == "schedule":
+            print(json.dumps({"scheduled": schedule_sync()}, indent=1)); return 0
         if cmd == "report":
             since = None
             if "--since" in rest:

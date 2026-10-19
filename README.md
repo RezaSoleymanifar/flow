@@ -69,6 +69,11 @@ classify: {block: classify, routes: [{to: merge}]}     # many children, in paral
 merge:    {join: true, gate: true, routes: [{to: apply}]}   # one item, one approval
 ```
 
+**Schedules** live in the workflow file: `schedule: "52 6 * * *"` (5-field cron). `flow schedule` writes one
+crontab line per scheduled workflow into a block owned by that FLOW_HOME, carrying its FLOW_* settings; other lines
+and other homes are left alone, and removing `schedule:` then rerunning it removes the line. Each line calls
+`flow run WORKFLOW`, which adds a run keyed by the minute and ticks it.
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the
