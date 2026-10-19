@@ -12,7 +12,7 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow run WORKFLOW [JSON]             add a run keyed by the minute, then tick that workflow (what a schedule calls)
   flow schedule                        write each workflow's `schedule:` (5-field cron) into the crontab, one line per
                                        workflow, in a block owned by this FLOW_HOME; other lines and homes are untouched
-  flow report [WORKFLOW] [--since DATE]   items, Claude calls, cost, retries, wait per step, from the events log
+  flow report [WORKFLOW] [--since DATE]   items, Claude calls, cost, tokens (in, cached, out), retries, wait per step
   flow status [WORKFLOW]               one JSON line per item
   flow show ITEM                       one item's whole state (ITEM may be WORKFLOW/ID when ids collide)
   flow approve ITEM                    pass a gate
@@ -47,7 +47,7 @@ arrival and can be approved any time, with whatever has arrived; without a gate 
 still arrive. Nobody is too late: a child arriving after its merge was approved or moved on opens the next round
 (ID.STEP-2, -3, ...), so you can stop whenever and continue from what is already done.
 """
-import ast, fcntl, json, os, shlex, subprocess, sys, threading, time, uuid
+import ast, fcntl, json, os, re, shlex, subprocess, sys, threading, time, uuid
 
 import yaml
 import jsonschema
@@ -122,6 +122,11 @@ def block(name):
     p = os.path.join(d, b.get("prompt", "prompt.md"))
     if not os.path.exists(p): raise ConfigError("block %r has no prompt file" % name)
     with open(p) as f: b["prompt_text"] = f.read()
+    def _inc(m):                       # {{include path}}: splice a file in, path relative to the flows home
+        q = os.path.join(HOME, m.group(1).strip())
+        if not os.path.exists(q): raise ConfigError("block %r includes a missing file %s" % (name, m.group(1)))
+        with open(q) as f: return f.read()
+    b["prompt_text"] = re.sub(r"\{\{\s*include\s+([^}]+)\}\}", _inc, b["prompt_text"])
     b.setdefault("output", {"type": "object"}); b.setdefault("tools", []); b.setdefault("external", None)
     try: jsonschema.Draft202012Validator.check_schema(b["output"])
     except jsonschema.SchemaError as e: raise ConfigError("block %r output is not a valid schema: %s" % (name, e.message))
@@ -232,6 +237,14 @@ def parse_reply(stdout, returncode, stderr, schema):
     return out, None, sid, cost
 
 LAST_SECONDS = 0.0
+LAST_TOKENS = {}                      # the last call's usage: in (fresh input), cached (read from cache), out
+
+def usage_of(stdout):
+    """Token counts from claude's JSON reply; {} when there are none."""
+    try: u = json.loads(stdout).get("usage") or {}
+    except (ValueError, AttributeError): return {}
+    return {"in": (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0),
+            "cached": u.get("cache_read_input_tokens") or 0, "out": u.get("output_tokens") or 0}
 
 def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=None):
     """One headless turn. Returns (output_or_None, reason_or_None, session_id, cost)."""
@@ -242,7 +255,7 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     if mcp: cmd += ["--mcp-config", json.dumps({"mcpServers": mcp})]
     if model: cmd += ["--model", model]
     cmd += ["--resume", session] if resume else ["--session-id", session]
-    global LAST_SECONDS; t0 = time.time()
+    global LAST_SECONDS, LAST_TOKENS; t0 = time.time(); LAST_TOKENS = {}
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -250,6 +263,7 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     except OSError as e:
         LAST_SECONDS = round(time.time() - t0, 2); return None, "could not start claude: %s" % e, None, None
     LAST_SECONDS = round(time.time() - t0, 2)   # wall time of this call, logged on the work/review event
+    LAST_TOKENS = usage_of(p.stdout)
     record(cmd, p)
     return parse_reply(p.stdout, p.returncode, p.stderr, schema)
 
@@ -316,7 +330,7 @@ def review(b, out, st, cwd):
            % (b["review"], compact(item), compact(answer)))
     sid = str(uuid.uuid4())    # always a fresh session: the reviewer never shares history with the worker
     verdict, err, _, cost = claude(msg, REVIEW_SCHEMA, sid, False, model=b.get("review_model"), cwd=cwd)
-    event(st, "review", session=sid, passed=bool(verdict and verdict["pass"]), cost=cost, seconds=LAST_SECONDS, error=err)
+    event(st, "review", session=sid, passed=bool(verdict and verdict["pass"]), cost=cost, seconds=LAST_SECONDS, tokens=LAST_TOKENS, error=err)
     if err: return "the reviewer could not answer: " + err
     return None if verdict["pass"] else "reviewer: " + verdict["notes"]
 
@@ -413,7 +427,7 @@ def run_step(wf, st):
         event(st, "session_lost", session=sid); del st["sessions"][st["step"]]; resuming = False
         out, reason, got, cost = run(str(uuid.uuid4()), False)
     if got: st["sessions"][st["step"]] = got   # a lost one is caught by session_lost on the next resume
-    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, seconds=LAST_SECONDS, reason=reason)
+    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, seconds=LAST_SECONDS, tokens=LAST_TOKENS, reason=reason)
     judge(wf, st, step, b, cwd, out, reason)
 
 def external_result(wf, st, out):
@@ -672,14 +686,15 @@ def report(wfname=None, since=None):
             if wfname and e.get("workflow") != wfname: continue
             if since and e["ts"] < since: continue
             w = rep.setdefault(e["workflow"], {"items": set(), "done": set(), "stuck": set(), "claude_calls": 0, "cost_usd": 0.0,
-                                               "claude_seconds": 0.0, "retries": 0, "first": e["ts"], "last": e["ts"], "steps": {}})
+                                               "claude_seconds": 0.0, "tokens": {"in": 0, "cached": 0, "out": 0}, "retries": 0, "first": e["ts"], "last": e["ts"], "steps": {}})
             w["items"].add(e["item"]); w["last"] = max(w["last"], e["ts"]); w["first"] = min(w["first"], e["ts"])
-            st = w["steps"].setdefault(e.get("step") or "?", {"work": 0, "external": 0, "review": 0, "retries": 0, "cost_usd": 0.0, "claude_seconds": 0.0, "seconds": 0.0, "_open": {}})
+            st = w["steps"].setdefault(e.get("step") or "?", {"work": 0, "external": 0, "review": 0, "retries": 0, "cost_usd": 0.0, "claude_seconds": 0.0, "tokens": {"in": 0, "cached": 0, "out": 0}, "seconds": 0.0, "_open": {}})
             ev = e["event"]
             if ev == "driver": st["driver"] = st.get("driver", 0) + 1; st["claude_seconds"] += 0
             if ev in ("work", "review"):
                 w["claude_calls"] += 1; w["cost_usd"] += e.get("cost") or 0; st["cost_usd"] += e.get("cost") or 0; st[ev] += 1
                 w["claude_seconds"] += e.get("seconds") or 0; st["claude_seconds"] += e.get("seconds") or 0
+                for k, v in (e.get("tokens") or {}).items(): w["tokens"][k] += v; st["tokens"][k] += v
             if ev == "external": st["external"] += 1; st["_open"][e["item"]] = ts(e)
             if ev == "done" and e["item"] in st["_open"]: st["seconds"] += (ts(e) - st["_open"].pop(e["item"])).total_seconds()
             if ev == "retry": w["retries"] += 1; st["retries"] += 1

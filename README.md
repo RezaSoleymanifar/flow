@@ -4,7 +4,7 @@ A minimal agent graph engine: workflows of headless Claude Code sessions as a gr
 
 - **Block**: a reusable step in `blocks/<name>/`. `block.yaml` holds the answer format (JSON Schema), allowed tools,
   an optional check script, an optional reviewer rubric, and `once: true` for steps with real-world effects.
-  `prompt.md` holds the instructions.
+  `prompt.md` holds the instructions; `{{include path}}` splices in a file (path relative to the flows home).
 - **Workflow**: `workflows/<name>.yaml` wires blocks into a graph. Routes are checked top to bottom; the first match
   wins. `when:` is a small safe expression over the step's answer (`out`) and the item's data (`data`). `each:` fans
   out, one new item per element. `gate: true` waits for a human.
@@ -99,7 +99,7 @@ flow add WORKFLOW '{"name": "Sam"}' --key sam
 flow add WORKFLOW @preset --key sam    # a named input from flavors.yaml ({workflow: {preset: input}}): one graph, many presets
 flow tick                   # run ready items (cron does this)
 flow status | flow show ITEM
-flow report [WORKFLOW] [--since DATE]   # items, Claude calls, cost, retries, wall time, and per-step waits, from the events log
+flow report [WORKFLOW] [--since DATE]   # items, Claude calls, cost, tokens (in, cached, out), retries, wall time, and per-step waits, from the events log
 flow approve ITEM | flow reject ITEM NOTE | flow jump ITEM STEP [NOTE]
 flow done ITEM '{"sent": true}' | flow fail ITEM REASON     # results of external steps
 ```
