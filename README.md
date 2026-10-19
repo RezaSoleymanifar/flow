@@ -78,7 +78,7 @@ flow add WORKFLOW '{"name": "Sam"}' --key sam
 flow add WORKFLOW @preset --key sam    # a named input from flavors.yaml ({workflow: {preset: input}}): one graph, many presets
 flow tick                   # run ready items (cron does this)
 flow status | flow show ITEM
-flow report [WORKFLOW] [--since DATE]   # items, Claude calls, cost, retries, wall time, and per-step waits, from the events log
+flow report [WORKFLOW] [--since DATE]   # items, Claude calls, cost, tokens (in, cached, out), retries, wall time, and per-step waits, from the events log
 flow approve ITEM | flow reject ITEM NOTE | flow jump ITEM STEP [NOTE]
 flow done ITEM '{"sent": true}' | flow fail ITEM REASON     # results of external steps
 ```
