@@ -410,7 +410,7 @@ def route(wf, st, out):
                 if not isinstance(elems, list): return stop(st, "each: %s is not a list" % r["each"])
                 spawned = []
                 for i, el in enumerate(elems):
-                    el = json.loads(json.dumps(el))
+                    el = json.loads(json.dumps(el, default=lambda o: None))   # a null inside an element reads as Missing; it stays null
                     key = str(el.get("key")) if isinstance(el, dict) and el.get("key") not in (None, "") else "%s-%d" % (st["id"], i)
                     child = {"input": el, "batch": st["data"].get("input")}   # the batch's own input (flavor etc.) rides along
                     grp = {"id": st["id"], "index": i}

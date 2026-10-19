@@ -673,6 +673,23 @@ class External(Base):
         self.assertEqual(self.statuses("batch"), {"s1": "done", "ann": "done", "bob": "done"})
         self.assertEqual(self.state("bob")["data"]["input"], {"key": "bob", "name": "Bob"})
 
+    def test_fan_out_elements_may_hold_nulls(self):
+        """Real batches carry empty fields (no match, no value); they reach the child as null."""
+        self.block("src", {"output": {"type": "object"}, "external": "human"})
+        self.workflow("nulls", """
+            start: src
+            steps:
+              src:
+                block: src
+                routes: [{each: out.found, to: handle}]
+              handle:
+                block: archive
+                routes: [{to: end}]
+        """)
+        self.add({}, key="n1", wf="nulls"); self.tick()
+        self.flow("done", "n1", json.dumps({"found": [{"key": "a", "rule": None, "deep": {"x": None}}]}))
+        self.assertEqual(self.state("a")["data"]["input"], {"key": "a", "rule": None, "deep": {"x": None}})
+
     def test_external_step_can_be_gated_and_reviewed(self):
         self.block("draft-ext", {"output": {"type": "object"}, "external": "human", "review": "Must contain hello."})
         self.workflow("g", """
