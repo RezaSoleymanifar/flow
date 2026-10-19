@@ -36,7 +36,7 @@ run at once, default 4; a block with `lane: <name>` runs one item at a time in t
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 `each:` children get the element as data.input and the batch's input as data.batch.
 """
-import ast, fcntl, json, os, shlex, subprocess, sys, threading, time, uuid
+import ast, fcntl, json, os, re, shlex, subprocess, sys, threading, time, uuid
 
 import yaml
 import jsonschema
@@ -111,6 +111,11 @@ def block(name):
     p = os.path.join(d, b.get("prompt", "prompt.md"))
     if not os.path.exists(p): raise ConfigError("block %r has no prompt file" % name)
     with open(p) as f: b["prompt_text"] = f.read()
+    def _inc(m):                       # {{include path}}: splice a file in, path relative to the flows home
+        q = os.path.join(HOME, m.group(1).strip())
+        if not os.path.exists(q): raise ConfigError("block %r includes a missing file %s" % (name, m.group(1)))
+        with open(q) as f: return f.read()
+    b["prompt_text"] = re.sub(r"\{\{\s*include\s+([^}]+)\}\}", _inc, b["prompt_text"])
     b.setdefault("output", {"type": "object"}); b.setdefault("tools", []); b.setdefault("external", None)
     try: jsonschema.Draft202012Validator.check_schema(b["output"])
     except jsonschema.SchemaError as e: raise ConfigError("block %r output is not a valid schema: %s" % (name, e.message))
