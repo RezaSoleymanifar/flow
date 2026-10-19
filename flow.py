@@ -46,7 +46,7 @@ RUNS = os.environ.get("FLOW_RUNS") or os.path.join(HOME, "runs")
 CLAUDE = shlex.split(os.environ.get("FLOW_CLAUDE", "claude"))
 TIMEOUT = int(os.environ.get("FLOW_TIMEOUT", "1800"))
 RECORD = os.environ.get("FLOW_RECORD")
-PARALLEL = int(os.environ.get("FLOW_PARALLEL", "4"))   # items run at once; a block's `lane` is a one-at-a-time queue
+PARALLEL = int(os.environ.get("FLOW_PARALLEL", "0")) or 10**6   # items run at once; 0 = no cap. A block's `lane` is still one at a time
 REVIEW_SCHEMA = {"type": "object", "required": ["pass", "notes"],
                  "properties": {"pass": {"type": "boolean"}, "notes": {"type": "string"}}}
 os.umask(0o027)   # state is readable by the sandbox group, writable only by the runner
