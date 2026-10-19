@@ -1,6 +1,6 @@
-# local-agent-orchestrator
+# flow
 
-A tiny local runner for workflows of headless Claude Code sessions. One Python file, no server, no database.
+A minimal agent graph engine: workflows of headless Claude Code sessions as a graph of blocks, with conditional routes, fan-out and fan-in, reviewers, retries and approval gates. One Python file, no server, no database.
 
 - **Block**: a reusable step in `blocks/<name>/`. `block.yaml` holds the answer format (JSON Schema), allowed tools,
   an optional check script, an optional reviewer rubric, and `once: true` for steps with real-world effects.
