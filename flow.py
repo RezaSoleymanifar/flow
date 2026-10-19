@@ -28,7 +28,7 @@ A block with `external: <who>` (e.g. chrome, human) is not run by a Claude sessi
 "external" until `flow done` or `flow fail` brings the result. The result goes through the block's format,
 check and reviewer like any other answer.
 
-Env: FLOW_HOME (default: this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
+Env: FLOW_HOME (default: ./flows or . of the folder you run it from, else this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
 runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLOW_TIMEOUT (seconds per turn),
 FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items
 run at once, default 4; a block with `lane: <name>` runs one item at a time in that lane, oldest first).
@@ -41,7 +41,13 @@ import ast, fcntl, json, os, shlex, subprocess, sys, threading, time, uuid
 import yaml
 import jsonschema
 
-HOME = os.environ.get("FLOW_HOME") or os.path.dirname(os.path.realpath(__file__))
+def _home():
+    """Where the blocks and workflows live: FLOW_HOME if set, else ./flows or . when run from a project, else here."""
+    if os.environ.get("FLOW_HOME"): return os.environ["FLOW_HOME"]
+    for cand in (os.path.join(os.getcwd(), "flows"), os.getcwd()):
+        if os.path.isdir(os.path.join(cand, "workflows")): return cand
+    return os.path.dirname(os.path.realpath(__file__))
+HOME = _home()
 RUNS = os.environ.get("FLOW_RUNS") or os.path.join(HOME, "runs")
 CLAUDE = shlex.split(os.environ.get("FLOW_CLAUDE", "claude"))
 TIMEOUT = int(os.environ.get("FLOW_TIMEOUT", "1800"))
