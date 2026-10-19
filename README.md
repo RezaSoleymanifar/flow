@@ -53,6 +53,18 @@ route then makes one item per element for the steps that follow, where paralleli
 gets its element as `data.input` and the batch's own input as `data.batch`, so a preset set on the batch is visible
 downstream (`when: data.batch.channel == "email"`).
 
+**Fan-in** closes a fan-out. A step with `join: true` and no block gathers the children of one `each:` fan-out
+(or one fork). Each child's result is written into ONE merged item the moment it arrives, so finished work is on
+disk at once: `data.<join step>` = `{parts, items, missing}` (arrived children's data, their ids, siblings that got
+stuck). With `gate: true` you can approve the merge any time, with whatever has arrived; without a gate it moves on
+once no sibling can still arrive. Nobody is too late: a child arriving after its merge was approved or moved on
+opens the next round (`ID.STEP-2`, `-3`, ...), so you can stop whenever and continue from what is already done.
+
+```yaml
+classify: {block: classify, routes: [{to: merge}]}     # many children, in parallel
+merge:    {join: true, gate: true, routes: [{to: apply}]}   # one item, one approval
+```
+
 ## How a step runs
 
 worker turn → answer matches the format? → check script → fresh reviewer → pass: follow the routes, or wait at the

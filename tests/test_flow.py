@@ -744,3 +744,106 @@ class Drivers(Base):
     def test_validate_catches_a_missing_driver_script(self):
         self.driver("print('{}')"); os.remove(os.path.join(self.home, "blocks", "ship", "drive.py"))
         self.assertIn("driver script drive.py is missing", json.loads(self.run_flow("validate").stdout)["ship"][0])
+
+
+class Join(Base):
+    """Fan-in: each child's result is published into one merged item the moment it arrives; a gated merge can be
+    approved any time with what has arrived; later arrivals open the next round, so nothing is ever too late."""
+    FAN = """
+        start: search
+        steps:
+          search:
+            block: search
+            routes: [{each: out.found, to: handle}]
+          handle:
+            block: handle
+            HANDLE_GATE
+            routes: [{to: merge}]
+          merge:
+            join: true
+            MERGE_GATE
+            routes: [{to: end}]
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.block("search", {"output": {"type": "object", "required": ["found"], "properties": {"found": {"type": "array"}}},
+                              "external": "chrome"})
+        self.block("handle", {"output": {"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}},
+                              "check": "check.py"},
+                   check="import json,sys\nd=json.load(sys.stdin)\n"
+                         "if d['data']['input']['name'] == 'Bad': print('bad one'); sys.exit(1)\n")
+
+    def fan(self, names, handle_gate=False, merge_gate=True):
+        self.workflow("fan", self.FAN.replace("HANDLE_GATE", "gate: true" if handle_gate else "")
+                                     .replace("MERGE_GATE", "gate: true" if merge_gate else ""))
+        self.add({"q": "x"}, key="s1", wf="fan"); self.tick()
+        self.flow("done", "s1", json.dumps({"found": [{"key": n.lower(), "name": n} for n in names]}))
+
+    def merge(self, iid="s1.merge"): return self.state(iid)["data"]["merge"]
+
+    def test_every_arrival_is_published_into_one_merge_approved_once(self):
+        self.fan(["Ann", "Bob"]); self.script({"n": 1}, {"n": 2}); self.tick()
+        self.assertEqual(self.statuses("fan"), {"s1": "done", "ann": "done", "bob": "done", "s1.merge": "waiting"})
+        m = self.merge()
+        self.assertEqual(m["items"], ["ann", "bob"]); self.assertEqual(m["missing"], [])
+        self.assertEqual([p["handle"]["n"] for p in m["parts"]], [1, 2])
+        self.assertEqual(self.state("s1.merge")["data"]["input"], {"q": "x"})   # the batch's own input rides along
+        self.assertEqual(len(self.events("merged")), 2)                         # one write per arrival
+        self.flow("approve", "s1.merge"); self.assertEqual(self.state("s1.merge")["status"], "done")
+
+    def test_the_first_arrival_is_on_disk_before_its_siblings_finish(self):
+        self.fan(["Ann", "Bob"], handle_gate=True); self.script({"n": 1}, {"n": 2}); self.tick()
+        self.flow("approve", "ann")
+        self.assertEqual(self.state("s1.merge")["status"], "waiting"); self.assertEqual(self.merge()["items"], ["ann"])
+        self.flow("approve", "bob"); self.assertEqual(self.merge()["items"], ["ann", "bob"])
+
+    def test_a_partial_merge_can_be_approved_and_a_later_arrival_opens_the_next_round(self):
+        self.fan(["Ann", "Bob"], handle_gate=True); self.script({"n": 1}, {"n": 2}); self.tick()
+        self.flow("approve", "ann"); self.flow("approve", "s1.merge")
+        self.assertEqual(self.state("s1.merge")["status"], "done")
+        self.flow("approve", "bob")
+        self.assertEqual(self.state("s1.merge-2")["status"], "waiting"); self.assertEqual(self.merge("s1.merge-2")["items"], ["bob"])
+        self.assertEqual(self.merge()["items"], ["ann"])                        # round one is untouched
+
+    def test_a_stuck_sibling_never_holds_the_group_and_is_named_missing(self):
+        self.fan(["Ann", "Bad"]); self.script({"n": 1}, {"n": 0}, {"n": 0}, {"n": 0}); self.tick()
+        self.assertEqual(self.state("bad")["status"], "stuck")
+        self.assertEqual(self.merge()["items"], ["ann"]); self.assertEqual(self.merge()["missing"], ["bad"])
+
+    def test_a_fixed_stuck_child_joins_the_open_merge_if_not_yet_approved(self):
+        self.fan(["Ann", "Bad"]); self.script({"n": 1}, {"n": 0}, {"n": 0}, {"n": 0}); self.tick()
+        self.flow("jump", "bad", "merge"); self.tick()
+        self.assertEqual(self.merge()["items"], ["ann", "bad"]); self.assertEqual(self.merge()["missing"], [])
+        self.assertNotIn("s1.merge-2", self.statuses("fan"))
+
+    def test_without_a_gate_the_merge_moves_on_once_no_sibling_can_still_arrive(self):
+        self.fan(["Ann", "Bob"], handle_gate=True, merge_gate=False); self.script({"n": 1}, {"n": 2}); self.tick()
+        self.flow("approve", "ann"); self.assertEqual(self.state("s1.merge")["status"], "collecting")
+        self.flow("approve", "bob"); self.tick()
+        self.assertEqual(self.state("s1.merge")["status"], "done"); self.assertEqual(self.merge()["items"], ["ann", "bob"])
+
+    def test_an_ungated_merge_does_not_wait_for_a_stuck_sibling(self):
+        self.fan(["Ann", "Bad"], merge_gate=False); self.script({"n": 1}, {"n": 0}, {"n": 0}, {"n": 0}); self.tick()
+        self.assertEqual(self.state("s1.merge")["status"], "done"); self.assertEqual(self.merge()["missing"], ["bad"])
+
+    def test_an_item_not_made_by_a_fan_out_cannot_reach_a_join(self):
+        self.workflow("solo", """
+            start: handle
+            steps:
+              handle:
+                block: archive
+                routes: [{to: merge}]
+              merge:
+                join: true
+                routes: [{to: end}]
+        """)
+        self.add({"name": "Ann"}, key="a", wf="solo"); self.script({}); self.tick()
+        self.assertEqual(self.state("a")["status"], "stuck"); self.assertIn("not made by a fan-out", self.state("a")["reason"])
+
+    def test_validate_refuses_a_block_on_a_join_step_and_accepts_a_plain_join(self):
+        self.fan(["Ann"])
+        self.assertEqual(json.loads(self.run_flow("validate", "fan").stdout)["fan"], [])
+        self.workflow("fan", self.FAN.replace("HANDLE_GATE", "").replace("join: true", "join: true\n            block: archive")
+                                     .replace("MERGE_GATE", ""))
+        self.assertIn("runs no block", json.loads(self.run_flow("validate", "fan").stdout)["fan"][0])

@@ -35,6 +35,12 @@ run at once, default 4; a block with `lane: <name>` runs one item at a time in t
 
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 `each:` children get the element as data.input and the batch's input as data.batch.
+A step with `join: true` (no block) is the fan-in for the children of one fan-out or fork. Each child's result is
+written into ONE merged item the moment it arrives: data.<join step> = {parts: [arrived children's data], items:
+[their ids], missing: [siblings that got stuck]}. With `gate: true` the merge waits at the gate from the first
+arrival and can be approved any time, with whatever has arrived; without a gate it moves on once no sibling can
+still arrive. Nobody is too late: a child arriving after its merge was approved or moved on opens the next round
+(ID.STEP-2, -3, ...), so you can stop whenever and continue from what is already done.
 """
 import ast, fcntl, json, os, shlex, subprocess, sys, threading, time, uuid
 
@@ -300,6 +306,7 @@ def worker_msg(b, st, resuming):
 
 def stop(st, reason):
     st.update(status="stuck", reason=reason); event(st, "stuck", reason=reason); save(st)
+    nudge_join(st)   # a stuck sibling must not leave the rest of its group waiting at a join
 
 def step_of(wf, st):
     step = wf["steps"].get(st["step"])
@@ -352,6 +359,14 @@ def run_driver(b, st, cwd):
     return out, None, True
 
 def run_step(wf, st):
+    step = wf["steps"].get(st["step"]) or {}
+    if step.get("join") and st.get("group"):   # a child put here by jump arrives like any other
+        return try_join(wf, st)
+    if step.get("join"):   # the merged item of a fan-in: its answer is the merge itself
+        out = st["data"].get(st["step"], {})
+        if step.get("gate"):
+            st["status"] = "waiting"; event(st, "gate"); save(st); return
+        return route(wf, st, out)
     step, b, cwd = step_of(wf, st)
     if b.get("driver"):   # a script does it; if it declines, the step falls through to its external owner
         st["status"] = "running"; save(st)
@@ -398,7 +413,8 @@ def route(wf, st, out):
                     el = json.loads(json.dumps(el))
                     key = str(el.get("key")) if isinstance(el, dict) and el.get("key") not in (None, "") else "%s-%d" % (st["id"], i)
                     child = {"input": el, "batch": st["data"].get("input")}   # the batch's own input (flavor etc.) rides along
-                    if new_item(st["workflow"], el, key, r["to"], data=child): spawned.append(safe_id(key))
+                    grp = {"id": st["id"], "index": i}
+                    if new_item(st["workflow"], el, key, r["to"], data=child, group=grp): spawned.append(safe_id(key))
                 event(st, "fan_out", to=r["to"], items=spawned)
                 return finish(st, "done")
         except Exception as e:
@@ -407,24 +423,89 @@ def route(wf, st, out):
             kids = []
             for branch in r["to"]:
                 if branch not in wf["steps"]: return stop(st, "routes to unknown step %r" % branch)
-                kid = new_item(st["workflow"], None, "%s.%s" % (st["id"], branch), branch, data=st["data"])
+                kid = new_item(st["workflow"], None, "%s.%s" % (st["id"], branch), branch, data=st["data"],
+                               group={"id": st["id"], "index": r["to"].index(branch)})
                 if kid: kids.append(kid["id"])
             event(st, "fork", to=r["to"], items=kids)
             return finish(st, "done")
         if r.get("to") == "end": return finish(st, "done")
         if r.get("to") not in wf["steps"]: return stop(st, "routes to unknown step %r" % r.get("to"))
+        if (wf["steps"][r["to"]] or {}).get("join"):   # fan-in: park here, merge when the whole group has settled
+            if not st.get("group"): return stop(st, "reached join step %r but was not made by a fan-out or fork" % r["to"])
+            event(st, "route", to=r["to"])
+            st.update(step=r["to"], attempt=0, feedback=None, reason=None)
+            return try_join(wf, st)
         event(st, "route", to=r["to"])
         st.update(step=r["to"], status="ready", attempt=0, feedback=None, reason=None); save(st); return
     stop(st, "no route matched")
 
 def finish(st, status):
     st["status"] = status; event(st, status); save(st)
+    nudge_join(st)
+
+JOIN_LOCK = threading.RLock()
+_JL = threading.local()
+UNSETTLED = ("ready", "running", "waiting", "external")   # a sibling in one of these can still arrive
+OPEN = ("collecting", "waiting")                            # a merged item still taking arrivals
+
+class join_lock:
+    """Tick threads and a separate `flow approve` never touch a merge at the same time. Reentrant."""
+    def __enter__(self):
+        JOIN_LOCK.acquire(); n = getattr(_JL, "n", 0); _JL.n = n + 1
+        if n == 0:
+            os.makedirs(RUNS, exist_ok=True)
+            _JL.f = open(os.path.join(RUNS, ".joinlock"), "w"); fcntl.flock(_JL.f, fcntl.LOCK_EX)
+    def __exit__(self, *a):
+        _JL.n -= 1
+        if _JL.n == 0: fcntl.flock(_JL.f, fcntl.LOCK_UN); _JL.f.close()
+        JOIN_LOCK.release()
+
+def open_merge(wfname, gid, j):
+    """The newest merged item of this group at join j, if it is still taking arrivals; and how many rounds exist."""
+    ms = sorted((s for s in all_items(wfname) if s.get("join_of") == gid and s["step"] == j), key=lambda s: s.get("seq", 0))
+    return (ms[-1] if ms and ms[-1]["status"] in OPEN else None), len(ms)
+
+def settle(m):
+    """Refresh who is missing; once no sibling can still arrive, an ungated merge moves on."""
+    sibs = [s for s in all_items(m["workflow"]) if (s.get("group") or {}).get("id") == m["join_of"]]
+    m["data"][m["step"]]["missing"] = [s["id"] for s in sibs if s["status"] == "stuck"]
+    if m["status"] == "collecting" and not any(s["status"] in UNSETTLED for s in sibs):
+        m["status"] = "ready"; event(m, "merge_complete")
+    save(m)
+
+def try_join(wf, st):
+    """A child arrived at a join: publish its result into the open merged item at once, opening a new round
+    when none is open (the last one was approved or already moved on). Nobody is ever too late."""
+    with join_lock():
+        gid, j = st["group"]["id"], st["step"]
+        m, rounds = open_merge(st["workflow"], gid, j)
+        if not m:
+            mid = safe_id("%s.%s" % (gid, j)) + ("-%d" % (rounds + 1) if rounds else "")
+            data = {"input": st["data"].get("batch", st["data"].get("input")), j: {"parts": [], "items": [], "missing": []}}
+            m = new_item(st["workflow"], None, mid, j, data=data)
+            if m is None: return stop(st, "merged item %s already exists but is not open" % mid)
+            m["join_of"] = gid; m["status"] = "waiting" if (wf["steps"][j] or {}).get("gate") else "collecting"
+        m["data"][j]["parts"].append(st["data"]); m["data"][j]["items"].append(st["id"])
+        event(m, "merged", child=st["id"])
+        event(st, "joined", into=m["id"]); st["status"] = "done"; save(st)
+        settle(m)
+
+def nudge_join(st):
+    """An item of a group just stopped or ended: refresh its group's open merge (missing list, ready to move on)."""
+    g = st.get("group")
+    if not g: return
+    try:
+        with join_lock():
+            for m in all_items(st["workflow"]):
+                if m.get("join_of") == g["id"] and m["status"] in OPEN: settle(m)
+    except Exception as e:
+        event(st, "join_error", reason=str(e))
 
 
 # ---------- items ----------
 def safe_id(k): return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(k))[:80].lstrip(".") or "item"
 
-def new_item(wfname, inp, key=None, step=None, data=None):
+def new_item(wfname, inp, key=None, step=None, data=None, group=None):
     wf = workflow(wfname)
     iid = safe_id(key) if key else time.strftime("%Y%m%d%H%M%S-") + uuid.uuid4().hex[:6]
     d = item_dir(wfname, iid)
@@ -433,12 +514,15 @@ def new_item(wfname, inp, key=None, step=None, data=None):
     st = {"id": iid, "workflow": wfname, "step": step or wf["start"], "status": "ready", "attempt": 0,
           "steps_taken": 0, "feedback": None, "reason": None, "data": json.loads(json.dumps(data)) if data else {"input": inp},
           "sessions": {}, "created": now(), "seq": time.time()}
+    if group: st["group"] = group   # which fan-out or fork made it, for a later join
     save(st); event(st, "added"); return st
 
 def recover(wf, st):
     """A 'running' item found by a tick that holds the lock was cut off mid-step (crash, reboot)."""
-    try: once = block(wf["steps"][st["step"]]["block"]).get("once")
-    except Exception: once = True   # unknown: be safe
+    if (wf["steps"].get(st["step"]) or {}).get("join"): once = False   # a merge has no outside effect
+    else:
+        try: once = block(wf["steps"][st["step"]]["block"]).get("once")
+        except Exception: once = True   # unknown: be safe
     if once:   # a step with real-world effects may have happened: never rerun it blind
         st.update(status="stuck", reason="cut off mid-step; check whether it already happened, then jump")
     else:
@@ -491,11 +575,14 @@ def validate(name):
     errs, steps = [], wf["steps"]
     for s, cfg in steps.items():
         cfg = cfg or {}
-        try:
+        if cfg.get("join"):
+            if cfg.get("block"): errs.append("%s: a join step merges items and runs no block" % s)
+        else:
+          try:
             b = block(cfg.get("block"))
             for k in ("check", "record", "driver"):
                 if b.get(k) and not os.path.exists(os.path.join(b["dir"], b[k])): errs.append("%s: %s script %s is missing" % (s, k, b[k]))
-        except Exception as e: errs.append("%s: %s" % (s, e))
+          except Exception as e: errs.append("%s: %s" % (s, e))
         routes = cfg.get("routes", [])
         if not isinstance(routes, list): errs.append("%s: routes must be a list" % s); continue
         for r in routes:
@@ -646,7 +733,11 @@ def main(a):
             st = load(rest[0]); wf = workflow(st["workflow"])
             if cmd in ("approve", "reject") and st["status"] != "waiting":
                 die("%s is %s, not waiting at a gate" % (st["id"], st["status"]))
-            if cmd == "approve":
+            if cmd == "approve" and (wf["steps"].get(st["step"]) or {}).get("join"):
+                with join_lock():   # approve exactly what has arrived; later arrivals open the next round
+                    st = load("%s/%s" % (st["workflow"], st["id"]))
+                    event(st, "approved", items=st["data"][st["step"]]["items"]); route(wf, st, st["data"][st["step"]])
+            elif cmd == "approve":
                 event(st, "approved"); route(wf, st, st["data"][st["step"]])
             elif cmd == "reject":
                 note = " ".join(rest[1:]) or "rejected"
