@@ -13,8 +13,8 @@ class Routing(Base):
         st = self.state("i1")
         self.assertEqual((st["status"], st["step"]), ("done", "send"))
         self.assertEqual(st["data"]["draft"], GOOD)
-        self.assertIn('"name": "Sam"', self.calls()[0]["msg"])
-        self.assertIn('"intent": "reply"', self.calls()[2]["msg"])        # the next step sees earlier answers
+        self.assertIn('"name":"Sam"', self.calls()[0]["msg"])
+        self.assertIn('"intent":"reply"', self.calls()[2]["msg"])        # the next step sees earlier answers
 
     def test_condition_sends_to_another_branch(self):
         self.add(); self.script({"intent": "decline", "text": "no thanks"}, PASS, {}); self.tick()
@@ -154,7 +154,7 @@ class Sessions(Base):
     def test_resume_message_carries_feedback_and_current_data(self):
         self.add(); self.script({"intent": "reply", "text": "a - b"}, GOOD, PASS, SENT); self.tick()
         m = self.calls()[1]["msg"]
-        self.assertIn("no dashes allowed", m); self.assertIn('"name": "Sam"', m)
+        self.assertIn("no dashes allowed", m); self.assertIn('"name":"Sam"', m)
 
 
 class Failures(Base):
@@ -165,6 +165,24 @@ class Failures(Base):
     def test_check_failure_retries_with_its_reason(self):
         self.add(); self.script({"intent": "reply", "text": "hi - there"}, GOOD, PASS, SENT); self.tick()
         self.assertIn("no dashes allowed", self.calls()[1]["msg"])
+
+    def test_review_view_narrows_what_the_reviewer_sees_or_skips_it(self):
+        """A batch where only some answers are risky: the reviewer sees just those, and nothing when none are."""
+        d = os.path.join(self.home, "blocks", "draft")
+        with open(os.path.join(d, "block.yaml")) as f: cfg = json.load(f)
+        cfg["review_view"] = "view.py"
+        with open(os.path.join(d, "block.yaml"), "w") as f: json.dump(cfg, f)
+        with open(os.path.join(d, "view.py"), "w") as f:
+            f.write("import json,sys\nd=json.load(sys.stdin)\n"
+                    "print(json.dumps({'item': {'risky': d['out']['text']}, 'answer': {'intent': d['out']['intent']}}"
+                    " if d['out']['intent'] == 'decline' else {}))\n")
+        self.script(GOOD, SENT); self.add(key="safe"); self.tick()
+        self.assertEqual(self.state("safe")["status"], "done")
+        self.assertEqual(len(self.calls()), 2)                              # worker, send: no reviewer at all
+        self.assertEqual(len(self.events("review_skipped")), 1)
+        self.script({"intent": "decline", "text": "No thanks."}, PASS, {}); self.add(key="risky"); self.tick()
+        msg = self.calls()[3]["msg"]                                        # the reviewer's prompt
+        self.assertIn('{"risky":"No thanks."}', msg); self.assertNotIn("Sam", msg)   # the view, not the whole item
 
     def test_reviewer_failure_retries_with_its_notes(self):
         self.add(); self.script(GOOD, {"pass": False, "notes": "too blunt"}, GOOD, PASS, SENT); self.tick()

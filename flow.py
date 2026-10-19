@@ -21,6 +21,8 @@ pointers. Retry, loop back and jump are all the same move: point the item at a s
   flow new block NAME [--external WHO] [--check] [--record]   scaffold blocks/NAME (block.yaml, prompt.md, stubs)
   flow new workflow NAME BLOCK [BLOCK...]                      scaffold workflows/NAME.yaml as a straight chain
 
+A block with `review_view: <script>` decides what its reviewer sees ({"out","data"} in, {"item","answer"} out) and
+can skip the review when nothing in the answer needs one (empty output): review only the risky part of a batch.
 A block with `driver: <script>` is done by that script for zero tokens: item data in on stdin, the answer out as
 JSON, then the same checks and record as any answer. Exit 3 = "I can't handle this one": the item falls back to
 the block's `external` owner. One script per block; the block boundary is the script boundary.
@@ -282,12 +284,33 @@ def run_record(b, out, st, cwd):
     event(st, "record", ok=p.returncode == 0, output=p.stdout.strip()[-400:])
     return None if p.returncode == 0 else "record failed: " + (p.stdout.strip() or p.stderr.strip()[-400:] or "no reason given")
 
+def review_view(b, out, st, cwd):
+    """A block's review_view script picks what the reviewer sees: {"out", "data"} in, {"item", "answer"} out.
+    An empty answer ({} or null) means nothing here needs a review, and the review is skipped. Returns (view, reason)."""
+    path = os.path.join(b["dir"], b["review_view"])
+    if not os.path.exists(path): raise ConfigError("review_view script %s is missing" % b["review_view"])
+    argv = [sys.executable, path] if path.endswith(".py") else [path]
+    try:
+        p = subprocess.run(argv, input=json.dumps({"out": out, "data": st["data"]}), capture_output=True, text=True, cwd=cwd, timeout=300)
+    except (subprocess.TimeoutExpired, OSError) as e: return None, "review_view failed: %s" % e
+    if p.returncode != 0: return None, "review_view failed: " + (p.stderr.strip()[-400:] or p.stdout.strip()[-400:] or "no reason given")
+    try: return json.loads(p.stdout or "null") or None, None
+    except ValueError: return None, "review_view gave no JSON: %s" % p.stdout[-300:]
+
+def compact(obj): return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))   # prompts: no whitespace tokens
+
 def review(b, out, st, cwd):
     if not b.get("review"): return None
+    item, answer = st["data"], out
+    if b.get("review_view"):   # the block narrows the review to what matters, or skips it when nothing does
+        view, err = review_view(b, out, st, cwd)
+        if err: return err
+        if not view: event(st, "review_skipped"); return None
+        item, answer = view.get("item", item), view.get("answer", answer)
     msg = ("You are reviewing another agent's work. You did not do it. Judge it only against the rubric.\n\n"
            "## Rubric\n%s\n\n## The item\n%s\n\n## The answer to review\n%s\n\n"
            "Return pass (true or false) and notes. If it fails, the notes must say exactly what to fix."
-           % (b["review"], json.dumps(st["data"], indent=1, ensure_ascii=False), json.dumps(out, indent=1, ensure_ascii=False)))
+           % (b["review"], compact(item), compact(answer)))
     sid = str(uuid.uuid4())    # always a fresh session: the reviewer never shares history with the worker
     verdict, err, _, cost = claude(msg, REVIEW_SCHEMA, sid, False, model=b.get("review_model"), cwd=cwd)
     event(st, "review", session=sid, passed=bool(verdict and verdict["pass"]), cost=cost, seconds=LAST_SECONDS, error=err)
@@ -295,7 +318,7 @@ def review(b, out, st, cwd):
     return None if verdict["pass"] else "reviewer: " + verdict["notes"]
 
 def worker_msg(b, st, resuming):
-    data = json.dumps(st["data"], indent=1, ensure_ascii=False)
+    data = compact(st["data"])
     fb = st.get("feedback")
     if not resuming:
         m = "%s\n\n## The item\n%s\n" % (b["prompt_text"], data)
@@ -580,7 +603,7 @@ def validate(name):
         else:
           try:
             b = block(cfg.get("block"))
-            for k in ("check", "record", "driver"):
+            for k in ("check", "record", "driver", "review_view"):
                 if b.get(k) and not os.path.exists(os.path.join(b["dir"], b[k])): errs.append("%s: %s script %s is missing" % (s, k, b[k]))
           except Exception as e: errs.append("%s: %s" % (s, e))
         routes = cfg.get("routes", [])
