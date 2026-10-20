@@ -118,6 +118,7 @@ def block(name):
         if not os.path.exists(q): raise ConfigError("block %r includes a missing file %s" % (name, m.group(1)))
         with open(q) as f: return f.read()
     b["prompt_text"] = re.sub(r"\{\{\s*include\s+([^}]+)\}\}", _inc, b["prompt_text"])
+    if b.get("review"): b["review"] = re.sub(r"\{\{\s*include\s+([^}]+)\}\}", _inc, str(b["review"]))
     b.setdefault("output", {"type": "object"}); b.setdefault("tools", []); b.setdefault("external", None)
     try: jsonschema.Draft202012Validator.check_schema(b["output"])
     except jsonschema.SchemaError as e: raise ConfigError("block %r output is not a valid schema: %s" % (name, e.message))
@@ -297,6 +298,7 @@ def run_record(b, out, st, cwd):
 
 def review(b, out, st, cwd):
     if not b.get("review"): return None
+    if b.get("review_when") and not evaluate(b["review_when"], out, st["data"]): return None   # not worth a reviewer
     msg = ("You are reviewing another agent's work. You did not do it. Judge it only against the rubric.\n\n"
            "## Rubric\n%s\n\n## The item\n%s\n\n## The answer to review\n%s\n\n"
            "Return pass (true or false) and notes. If it fails, the notes must say exactly what to fix."

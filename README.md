@@ -3,7 +3,8 @@
 A tiny local runner for workflows of headless Claude Code sessions. One Python file, no server, no database.
 
 - **Block**: a reusable step in `blocks/<name>/`. `block.yaml` holds the answer format (JSON Schema), allowed tools,
-  an optional check script, an optional reviewer rubric, and `once: true` for steps with real-world effects.
+  an optional check script, an optional reviewer rubric (`review:`, may `{{include}}` files; `review_when:` limits
+  the review to answers matching an expression over `out`), and `once: true` for steps with real-world effects.
   `prompt.md` holds the instructions; `{{include path}}` splices in a file (path relative to the flows home).
 - **Workflow**: `workflows/<name>.yaml` wires blocks into a graph. Routes are checked top to bottom; the first match
   wins. A step may set `model:` to pin the model for that step. `when:` is a small safe expression over the step's answer (`out`) and the item's data (`data`). `each:` fans
