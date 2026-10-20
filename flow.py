@@ -324,6 +324,7 @@ def step_of(wf, st):
     step = wf["steps"].get(st["step"])
     if step is None: raise ConfigError("step %r is not in the workflow" % st["step"])
     b = block(step.get("block"))
+    if step.get("model"): b["model"] = step["model"]     # a step may pin the model (the same block as haiku and as opus)
     cwd = os.path.join(item_dir(st["workflow"], st["id"]), "work")
     os.makedirs(cwd, exist_ok=True)
     try: os.chmod(cwd, 0o2770)
@@ -391,7 +392,7 @@ def run_step(wf, st):
         event(st, "session_lost", session=sid); del st["sessions"][st["step"]]; resuming = False
         out, reason, got, cost = run(str(uuid.uuid4()), False)
     if got: st["sessions"][st["step"]] = got   # a lost one is caught by session_lost on the next resume
-    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, seconds=LAST_SECONDS, tokens=LAST_TOKENS, reason=reason)
+    event(st, "work", session=got, resumed=resuming, attempt=st["attempt"], ok=reason is None, cost=cost, seconds=LAST_SECONDS, tokens=LAST_TOKENS, model=b.get("model"), reason=reason)
     judge(wf, st, step, b, cwd, out, reason)
 
 def external_result(wf, st, out):
