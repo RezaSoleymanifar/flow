@@ -33,7 +33,7 @@ check and reviewer like any other answer.
 Env: FLOW_HOME (default: ./flows or . of the folder you run it from, else this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
 runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLOW_TIMEOUT (seconds per turn),
 FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items at once; default 2 per CPU core, max 32; 0 = no cap)
-run at once, default 4; a block with `lane: <name>` runs one item at a time in that lane, oldest first).
+a block with `lane: <name>` runs one item at a time in that lane, oldest first).
 
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 `each:` children get the element as data.input and the batch's input as data.batch.
