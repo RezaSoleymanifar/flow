@@ -1,3 +1,6 @@
+import os
+import subprocess
+import unittest
 """Behavior and edge-case tests, run against the realistic fake claude. python3 -m unittest discover -s tests"""
 import fcntl, json, os, re, sys, time, unittest
 
@@ -726,6 +729,31 @@ class External(Base):
         self.assertEqual(self.calls()[0]["tools"], "")                   # the reviewer ran, no tools
         self.flow("approve", "x"); self.assertEqual(self.state("x")["status"], "done")
 
+
+
+class SyncTest(unittest.TestCase):
+    """GitHub is the one copy: a run pulls what others pushed, pushes local commits, refuses uncommitted edits."""
+    def test_sync(self):
+        import shutil, tempfile
+        root = tempfile.mkdtemp(); remote, a, b = (os.path.join(root, x) for x in ("remote.git", "a", "b"))
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        git = lambda d, *x: subprocess.run(["git", "-C", d] + list(x), env=env, check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", remote], check=True)
+        subprocess.run(["git", "clone", "-q", remote, a], check=True)
+        os.makedirs(os.path.join(a, "workflows")); open(os.path.join(a, "workflows", ".keep"), "w").close()
+        shutil.copy(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow.py"), a)
+        open(os.path.join(a, ".gitignore"), "w").write("runs/\n")
+        git(a, "add", "-A"); git(a, "commit", "-qm", "init"); git(a, "push", "-q", "origin", "main")
+        subprocess.run(["git", "clone", "-q", remote, b], check=True)
+        tick = lambda d: subprocess.run([sys.executable, os.path.join(d, "flow.py"), "tick"], env=dict(env, FLOW_HOME=d, FLOW_SYNC="1"),
+                                        capture_output=True, text=True)
+        open(os.path.join(a, "note"), "w").write("1"); git(a, "add", "note"); git(a, "commit", "-qm", "n"); git(a, "push", "-q")
+        self.assertEqual(tick(b).returncode, 0); self.assertEqual(git(b, "rev-parse", "HEAD"), git(a, "rev-parse", "HEAD"))   # pulled
+        open(os.path.join(b, "note"), "w").write("2")
+        r = tick(b); self.assertNotEqual(r.returncode, 0); self.assertIn("uncommitted", r.stdout + r.stderr)                 # refused
+        git(b, "commit", "-qam", "m"); self.assertEqual(tick(b).returncode, 0)
+        self.assertEqual(git(remote, "rev-parse", "main"), git(b, "rev-parse", "HEAD"))                                       # pushed
+        shutil.rmtree(root)
 
 if __name__ == "__main__":
     unittest.main()

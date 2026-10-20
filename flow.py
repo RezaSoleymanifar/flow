@@ -35,6 +35,7 @@ A block with `external: <who>` (e.g. chrome, human) is not run by a Claude sessi
 "external" until `flow done` or `flow fail` brings the result. The result goes through the block's format,
 check and reviewer like any other answer.
 
+Before add, tick and run, flow syncs the engine's and FLOW_HOME's git repos with GitHub (FLOW_SYNC=0: off).
 Env: FLOW_HOME (default: ./flows or . of the folder you run it from, else this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
 runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLOW_TIMEOUT (seconds per turn),
 FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items
@@ -774,11 +775,40 @@ def new(kind, name, rest):
     die("usage: flow new block|workflow NAME ...")
 
 
+
+# ---------- code sync ----------
+def _git(d, *a):
+    return subprocess.run(["git", "-C", d] + list(a), capture_output=True, text=True, timeout=120)
+
+def sync_code():
+    """GitHub is the one copy of the code. Before work runs, this machine refuses uncommitted edits, pushes its own
+    commits and pulls everyone else's, for the engine's repo and FLOW_HOME's. A repo with no upstream is left alone;
+    an unreachable GitHub only warns. If the engine itself was updated, flow restarts on the new code. FLOW_SYNC=0: off."""
+    if os.environ.get("FLOW_SYNC", "1") == "0": return
+    engine_top = _git(os.path.dirname(os.path.realpath(__file__)), "rev-parse", "--show-toplevel").stdout.strip()
+    restart = False
+    for top, scope in ((engine_top, engine_top), (_git(HOME, "rev-parse", "--show-toplevel").stdout.strip(), HOME)):
+        if not top or _git(top, "rev-parse", "--abbrev-ref", "@{u}").returncode: continue
+        dirty = _git(top, "status", "--porcelain", "--untracked-files=no", "--", os.path.abspath(scope)).stdout.strip()
+        if dirty: die("uncommitted changes in %s; commit them first (flow pushes them):\n%s" % (top, dirty))
+        if _git(top, "fetch", "-q").returncode:
+            print("flow: GitHub unreachable for %s; running on the local copy" % top, file=sys.stderr); continue
+        ahead, behind = map(int, _git(top, "rev-list", "--left-right", "--count", "HEAD...@{u}").stdout.split())
+        if ahead and behind: die("%s has diverged from GitHub (%d local, %d remote commits); merge first" % (top, ahead, behind))
+        if ahead and _git(top, "push", "-q").returncode: die("could not push %s to GitHub" % top)
+        if behind:
+            if _git(top, "merge", "-q", "--ff-only", "@{u}").returncode: die("could not update %s from GitHub" % top)
+            restart |= top == engine_top
+    if restart:
+        os.environ["FLOW_SYNC"] = "0"   # already synced; the restart only loads the new code
+        os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)] + sys.argv[1:])
+
 # ---------- cli ----------
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"): print(__doc__); return 0
     cmd, rest = a[0], a[1:]
     try:
+        if cmd in ("add", "tick", "run"): sync_code()   # work runs only on the code GitHub has
         if cmd == "add":
             opts = {}
             for o in ("--key", "--step"):
