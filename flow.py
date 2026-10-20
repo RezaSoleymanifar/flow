@@ -32,7 +32,7 @@ check and reviewer like any other answer.
 
 Env: FLOW_HOME (default: ./flows or . of the folder you run it from, else this folder), FLOW_RUNS (item state, default FLOW_HOME/runs), FLOW_CLAUDE (command that
 runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLOW_TIMEOUT (seconds per turn),
-FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items
+FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items at once; default 2 per CPU core, max 32; 0 = no cap)
 run at once, default 4; a block with `lane: <name>` runs one item at a time in that lane, oldest first).
 
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
@@ -54,7 +54,10 @@ RUNS = os.environ.get("FLOW_RUNS") or os.path.join(HOME, "runs")
 CLAUDE = shlex.split(os.environ.get("FLOW_CLAUDE", "claude"))
 TIMEOUT = int(os.environ.get("FLOW_TIMEOUT", "1800"))
 RECORD = os.environ.get("FLOW_RECORD")
-PARALLEL = int(os.environ.get("FLOW_PARALLEL", "0")) or 10**6   # items run at once; 0 = no cap. A block's `lane` is still one at a time
+# Items run in parallel. Default: two per CPU core, at most 32: each Claude session is a Node process, and an
+# unlimited fan-out (577 items at once, 2026-10-19) drove a WSL box to load 180. FLOW_PARALLEL overrides; 0 = unlimited.
+_env = os.environ.get("FLOW_PARALLEL")
+PARALLEL = (int(_env) or 10**6) if _env else max(4, min(32, 2 * (os.cpu_count() or 2)))
 REVIEW_SCHEMA = {"type": "object", "required": ["pass", "notes"],
                  "properties": {"pass": {"type": "boolean"}, "notes": {"type": "string"}}}
 os.umask(0o027)   # state is readable by the sandbox group, writable only by the runner
