@@ -244,7 +244,8 @@ def usage_of(stdout):
 
 def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=None):
     """One headless turn. Returns (output_or_None, reason_or_None, session_id, cost)."""
-    cmd = CLAUDE + ["-p", msg, "--output-format", "json", "--json-schema", json.dumps(schema),
+    big = len(msg.encode()) > 100000   # the OS caps one argument near 128 KB: a long prompt goes in on stdin instead
+    cmd = CLAUDE + ["-p"] + ([] if big else [msg]) + ["--output-format", "json", "--json-schema", json.dumps(schema),
                     "--permission-mode", "dontAsk", "--strict-mcp-config", "--tools", ",".join(tools)]
     allowed = list(tools) + ["mcp__%s" % s for s in (mcp or {})]
     if allowed: cmd += ["--allowedTools", ",".join(allowed)]
@@ -255,7 +256,7 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     cmd += ["--resume", session] if resume else ["--session-id", session]
     global LAST_SECONDS, LAST_TOKENS; t0 = time.time(); LAST_TOKENS = {}
     try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT, input=msg if big else None)
     except subprocess.TimeoutExpired:
         LAST_SECONDS = round(time.time() - t0, 2); return None, "the session timed out after %ss" % TIMEOUT, None, None
     except OSError as e:
@@ -472,9 +473,15 @@ def recover(wf, st):
 
 def tick(wfname=None):
     os.makedirs(RUNS, exist_ok=True)
+    # A named tick touches only its own workflow's items: it shares the global lock and holds its workflow's lock, so
+    # `tick find` and `tick apply` run side by side. An unnamed tick touches everything and holds the global lock alone.
     lock = open(os.path.join(RUNS, ".lock"), "w")
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try: fcntl.flock(lock, (fcntl.LOCK_SH if wfname else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except BlockingIOError: return {"skipped": "another tick is running"}
+    if wfname:
+        wlock = open(os.path.join(RUNS, ".lock-%s" % wfname), "w")
+        try: fcntl.flock(wlock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: return {"skipped": "another %s tick is running" % wfname}
     wfs, moved, bad = {}, 0, []
     def wf_of(st):
         if st["workflow"] not in wfs: wfs[st["workflow"]] = workflow(st["workflow"])
