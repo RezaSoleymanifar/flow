@@ -38,7 +38,19 @@ a block with `lane: <name>` runs one item at a time in that lane, oldest first).
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 `each:` children get the element as data.input and the batch's input as data.batch.
 """
-import ast, fcntl, json, os, re, shlex, subprocess, sys, tempfile, threading, time, uuid
+import ast, json, os, re, shlex, subprocess, sys, tempfile, threading, time, uuid
+try: import fcntl
+except ImportError: fcntl = None   # Windows: msvcrt byte-range locks stand in (see _lock)
+
+def _lock(f, shared=False, slot=0):
+    """Non-blocking file lock. POSIX: flock. Windows: a shared lock holds one byte in 1..999 (slot), an exclusive lock
+    holds bytes 0..999, so an exclusive lock waits for every shared holder and vice versa. Raises BlockingIOError if busy."""
+    if fcntl: fcntl.flock(f, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB); return
+    import msvcrt
+    f.seek(1 + slot % 999 if shared else 0)
+    try: msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1 if shared else 1000)
+    except OSError as e: raise BlockingIOError(str(e))
+
 
 import yaml
 import jsonschema
@@ -476,11 +488,11 @@ def tick(wfname=None):
     # A named tick touches only its own workflow's items: it shares the global lock and holds its workflow's lock, so
     # `tick find` and `tick apply` run side by side. An unnamed tick touches everything and holds the global lock alone.
     lock = open(os.path.join(RUNS, ".lock"), "w")
-    try: fcntl.flock(lock, (fcntl.LOCK_SH if wfname else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+    try: _lock(lock, shared=bool(wfname), slot=sum(map(ord, wfname or "")))
     except BlockingIOError: return {"skipped": "another tick is running"}
     if wfname:
         wlock = open(os.path.join(RUNS, ".lock-%s" % wfname), "w")
-        try: fcntl.flock(wlock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try: _lock(wlock)
         except BlockingIOError: return {"skipped": "another %s tick is running" % wfname}
     wfs, moved, bad = {}, 0, []
     def wf_of(st):
