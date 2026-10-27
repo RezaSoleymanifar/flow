@@ -35,6 +35,7 @@ runs claude, default "claude"; setup.sh points it at the sandboxed wrapper), FLO
 FLOW_RECORD (folder: save every raw claude reply, to build test fixtures from real runs), FLOW_PARALLEL (items at once; default 2 per CPU core, max 32; 0 = no cap)
 a block with `lane: <name>` runs one item at a time in that lane, oldest first).
 
+A step's `on_stuck: STEP` sends the item to STEP once its retries run out, instead of stopping it.
 A route's `to` may be a list: the item forks, one child per branch, each with its own sessions.
 `each:` children get the element as data.input and the batch's input as data.batch.
 """
@@ -268,7 +269,7 @@ def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=Non
     cmd += ["--resume", session] if resume else ["--session-id", session]
     global LAST_SECONDS, LAST_TOKENS; t0 = time.time(); LAST_TOKENS = {}
     try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT, input=msg if big else None)
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT, input=msg if big else None)
     except subprocess.TimeoutExpired:
         LAST_SECONDS = round(time.time() - t0, 2); return None, "the session timed out after %ss" % TIMEOUT, None, None
     except OSError as e:
@@ -291,7 +292,7 @@ def run_check(b, out, st, cwd):
     argv = [sys.executable, path] if path.endswith(".py") else [path]
     try:
         p = subprocess.run(argv, input=json.dumps({"out": out, "data": st["data"]}), capture_output=True,
-                           text=True, cwd=cwd, timeout=300)
+                           text=True, encoding="utf-8", errors="replace", cwd=cwd, timeout=300)
     except subprocess.TimeoutExpired: return "check failed: the check timed out"
     except OSError as e: raise ConfigError("check script could not run: %s" % e)
     if p.returncode == 0: return None
@@ -307,7 +308,7 @@ def run_record(b, out, st, cwd):
     argv = [sys.executable, path] if path.endswith(".py") else [path]
     try:
         p = subprocess.run(argv, input=json.dumps({"out": out, "data": st["data"], "item": st["id"],
-                           "workflow": st["workflow"], "step": st["step"]}), capture_output=True, text=True, cwd=cwd, timeout=300)
+                           "workflow": st["workflow"], "step": st["step"]}), capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd, timeout=300)
     except (subprocess.TimeoutExpired, OSError) as e: return "record failed: %s" % e
     event(st, "record", ok=p.returncode == 0, output=p.stdout.strip()[-400:])
     return None if p.returncode == 0 else "record failed: " + (p.stdout.strip() or p.stderr.strip()[-400:] or "no reason given")
@@ -358,7 +359,13 @@ def judge(wf, st, step, b, cwd, out, reason):
         st["feedback"] = "Your last answer failed. %s. Fix that." % reason
         if isinstance(reason, FinalFail): return stop(st, "stopped by a hard rule: " + reason)
         if b.get("once"): return stop(st, "a run-once step failed, so it is not retried on its own: " + reason)
-        if st["attempt"] >= wf["max_attempts"]: return stop(st, reason)
+        if st["attempt"] >= wf["max_attempts"]:
+            fb = step.get("on_stuck")              # a fallback step takes over instead of stopping (e.g. a model fills what a script could not)
+            if fb and fb in wf["steps"] and fb != st["step"]:
+                event(st, "fallback", to=fb, reason=reason)
+                st.update(step=fb, status="ready", attempt=0, feedback="The %s step gave up after %d tries: %s" % (st["step"], wf["max_attempts"], reason))
+                save(st); return
+            return stop(st, reason)
         st["status"] = "ready"; event(st, "retry", reason=reason); save(st); return
     st["data"][st["step"]] = out; st["feedback"] = None; st["reason"] = None
     rec = run_record(b, out, st, cwd)
@@ -377,7 +384,7 @@ def run_driver(b, st, cwd):
     global LAST_SECONDS; t0 = time.time()
     try:
         p = subprocess.run(argv, input=json.dumps({"data": st["data"], "item": st["id"], "workflow": st["workflow"], "step": st["step"],
-                                                   "feedback": st.get("feedback")}), capture_output=True, text=True, cwd=cwd, timeout=TIMEOUT)
+                                                   "feedback": st.get("feedback")}), capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd, timeout=TIMEOUT)
     except subprocess.TimeoutExpired: LAST_SECONDS = round(time.time() - t0, 2); return None, "the driver timed out after %ss" % TIMEOUT, True
     except OSError as e: raise ConfigError("driver script could not run: %s" % e)
     LAST_SECONDS = round(time.time() - t0, 2)
