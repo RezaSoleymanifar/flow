@@ -256,7 +256,7 @@ def usage_of(stdout):
 
 def claude(msg, schema, session, resume, tools=(), mcp=None, model=None, cwd=None):
     """One headless turn. Returns (output_or_None, reason_or_None, session_id, cost)."""
-    big = len(msg.encode()) > 100000   # the OS caps one argument near 128 KB: a long prompt goes in on stdin instead
+    big = len(msg.encode()) > (20000 if os.name == "nt" else 100000)   # one argument caps near 128 KB on Linux, the whole command line at 32 K on Windows: a long prompt goes in on stdin instead
     cmd = CLAUDE + ["-p"] + ([] if big else [msg]) + ["--output-format", "json", "--json-schema", json.dumps(schema),
                     "--permission-mode", "dontAsk", "--strict-mcp-config", "--tools", ",".join(tools)]
     allowed = list(tools) + ["mcp__%s" % s for s in (mcp or {})]
