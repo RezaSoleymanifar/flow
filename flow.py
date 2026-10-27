@@ -88,16 +88,16 @@ class ConfigError(Exception):
 def now(): return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 def read_yaml(p):
-    with open(p) as f: return yaml.safe_load(f) or {}
+    with open(p, encoding="utf-8") as f: return yaml.safe_load(f) or {}
 
 def write_json(p, obj):   # atomic: a crash never leaves half a state file
     tmp = p + ".tmp"
-    with open(tmp, "w") as f: json.dump(obj, f, indent=1)
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(obj, f, indent=1)
     os.replace(tmp, p)
 
 def event(item, ev, **detail):
     os.makedirs(RUNS, exist_ok=True)
-    with open(os.path.join(RUNS, "events.jsonl"), "a") as f:
+    with open(os.path.join(RUNS, "events.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": now(), "item": item.get("id"), "workflow": item.get("workflow"),
                             "step": item.get("step"), "event": ev, **detail}) + "\n")
 
@@ -105,7 +105,7 @@ def flavor(wfname, name):
     """A named preset of item input, from FLOW_HOME/flavors.yaml: {workflow: {flavor: {...input}}}."""
     p = os.path.join(HOME, "flavors.yaml")
     if not os.path.exists(p): die("no flavors.yaml in %s" % HOME)
-    with open(p) as f: fl = yaml.safe_load(f) or {}
+    with open(p, encoding="utf-8") as f: fl = yaml.safe_load(f) or {}
     if name not in (fl.get(wfname) or {}): die("no flavor %r for workflow %s (have: %s)" % (name, wfname, ", ".join(fl.get(wfname) or [])))
     inp = fl[wfname][name]
     if not isinstance(inp, dict): die("flavor %s.%s must be a mapping" % (wfname, name))
@@ -128,11 +128,11 @@ def block(name):
     b["dir"] = d
     p = os.path.join(d, b.get("prompt", "prompt.md"))
     if not os.path.exists(p): raise ConfigError("block %r has no prompt file" % name)
-    with open(p) as f: b["prompt_text"] = f.read()
+    with open(p, encoding="utf-8") as f: b["prompt_text"] = f.read()
     def _inc(m):                       # {{include path}}: splice a file in, path relative to the flows home
         q = os.path.join(HOME, m.group(1).strip())
         if not os.path.exists(q): raise ConfigError("block %r includes a missing file %s" % (name, m.group(1)))
-        with open(q) as f: return f.read()
+        with open(q, encoding="utf-8") as f: return f.read()
     b["prompt_text"] = re.sub(r"\{\{\s*include\s+([^}]+)\}\}", _inc, b["prompt_text"])
     if b.get("review"): b["review"] = re.sub(r"\{\{\s*include\s+([^}]+)\}\}", _inc, str(b["review"]))
     b.setdefault("output", {"type": "object"}); b.setdefault("tools", []); b.setdefault("external", None)
@@ -153,7 +153,7 @@ def all_items(wfname=None, bad=None):
             p = os.path.join(d, iid, "state.json")
             if not os.path.exists(p): continue
             try:
-                with open(p) as f: out.append(json.load(f))
+                with open(p, encoding="utf-8") as f: out.append(json.load(f))
             except (ValueError, OSError):
                 if bad is not None: bad.append("%s/%s" % (wf, iid))
     return out
@@ -223,7 +223,7 @@ def evaluate(expr, out, data):
 def record(cmd, p):
     if not RECORD: return
     os.makedirs(RECORD, exist_ok=True)
-    with open(os.path.join(RECORD, "%d-%s.json" % (time.time() * 1000, uuid.uuid4().hex[:6])), "w") as f:
+    with open(os.path.join(RECORD, "%d-%s.json" % (time.time() * 1000, uuid.uuid4().hex[:6])), "w", encoding="utf-8") as f:
         json.dump({"argv": cmd[len(CLAUDE):], "returncode": p.returncode, "stdout": p.stdout, "stderr": p.stderr}, f, indent=1)
 
 def parse_reply(stdout, returncode, stderr, schema):
@@ -570,7 +570,7 @@ def report(wfname=None, since=None):
     if not os.path.exists(p): return {}
     def ts(e): return datetime.strptime(e["ts"][:19], "%Y-%m-%dT%H:%M:%S")
     rep = {}
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         for l in f:
             try: e = json.loads(l)
             except ValueError: continue
@@ -642,7 +642,7 @@ def new(kind, name, rest):
         if "--check" in rest: files["check.py"] = CHECK_PY
         if "--record" in rest: files["record.py"] = RECORD_PY
         for fn, body in files.items():
-            with open(os.path.join(d, fn), "w") as f: f.write(body)
+            with open(os.path.join(d, fn), "w", encoding="utf-8") as f: f.write(body)
         return {"created": sorted(os.path.join("blocks", safe, fn) for fn in files)}
     if kind == "workflow":
         if not rest: die("usage: flow new workflow NAME BLOCK [BLOCK...]")
@@ -655,7 +655,7 @@ def new(kind, name, rest):
             nxt = rest[i + 1] if i + 1 < len(rest) else "end"
             steps.append("  %s:\n    block: %s\n    routes: [{to: %s}]" % (b, b, nxt))
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as f: f.write(WORKFLOW_YAML % {"name": safe, "first": rest[0], "steps": "\n".join(steps) + "\n"})
+        with open(p, "w", encoding="utf-8") as f: f.write(WORKFLOW_YAML % {"name": safe, "first": rest[0], "steps": "\n".join(steps) + "\n"})
         return {"created": os.path.join("workflows", safe + ".yaml"), "problems": validate(safe)}
     die("usage: flow new block|workflow NAME ...")
 
