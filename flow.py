@@ -577,9 +577,15 @@ def recover(wf, st):
 
 def tick(wfname=None):
     os.makedirs(RUNS, exist_ok=True)
+    # A named tick touches only its own workflow: it shares the global lock and holds its workflow lock, so `tick apply`
+    # and `tick recruiters` run side by side. An unnamed tick touches everything and holds the global lock alone (Reza 2026-11-12).
     lock = open(os.path.join(RUNS, ".lock"), "w")
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try: fcntl.flock(lock, (fcntl.LOCK_SH if wfname else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except BlockingIOError: return {"skipped": "another tick is running"}
+    if wfname:
+        wlock = open(os.path.join(RUNS, ".lock-%s" % wfname), "w")
+        try: fcntl.flock(wlock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: return {"skipped": "another %s tick is running" % wfname}
     wfs, moved, bad = {}, 0, []
     def wf_of(st):
         if st["workflow"] not in wfs: wfs[st["workflow"]] = workflow(st["workflow"])
